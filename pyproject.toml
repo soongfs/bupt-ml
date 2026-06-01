@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pointcls"
+version = "0.1.0"
+description = "ModelNet40 Point Cloud Classification — DGCNN & PointMLP"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "matplotlib>=3.7",
+    "h5py>=3.8",
+    "scipy>=1.10",
+    "tqdm>=4.65",
+]
+
+[project.scripts]
+pointcls = "pointcls.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
