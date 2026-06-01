@@ -68,17 +68,17 @@ class GeometricAffine(nn.Module):
     4. Add centroid back
     """
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, coord_channels: int = 3):
         super().__init__()
         # Two-layer affine: learn scale + bias per channel for each group
         self.affine_alpha = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Conv1d(coord_channels, channels, kernel_size=1),
             nn.BatchNorm1d(channels),
             nn.ReLU(inplace=True),
             nn.Conv1d(channels, channels, kernel_size=1),
         )
         self.affine_beta = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Conv1d(coord_channels, channels, kernel_size=1),
             nn.BatchNorm1d(channels),
             nn.ReLU(inplace=True),
             nn.Conv1d(channels, channels, kernel_size=1),
@@ -183,7 +183,7 @@ class PointMLPStage(nn.Module):
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         ) if in_channels != out_channels else nn.Identity()
-        self.geo_affine = GeometricAffine(out_channels)
+        self.geo_affine = GeometricAffine(out_channels, coord_channels=3)
         self.res_mlp = ResMLPBlock(out_channels)
 
     def forward(self, xyz: torch.Tensor, features: torch.Tensor):

@@ -5,6 +5,8 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 
+POINT_EXTENSIONS = (".off", ".txt")
+
 
 def farthest_point_sample(points: torch.Tensor, npoints: int) -> torch.Tensor:
     """Farthest Point Sampling (FPS) implemented in pure PyTorch.
@@ -107,10 +109,44 @@ def read_off(filepath: str) -> np.ndarray:
     return np.array(vertices, dtype=np.float32)
 
 
+def read_txt(filepath: str) -> np.ndarray:
+    """Parse a CSV-style ModelNet text point cloud.
+
+    Pointcept's ModelNet40 mirror stores one sample per .txt file with rows:
+    x, y, z, nx, ny, nz.
+
+    Args:
+        filepath: Path to .txt file.
+
+    Returns:
+        Numpy array of shape (N, 3) or (N, 6+).
+    """
+    try:
+        points = np.loadtxt(filepath, delimiter=",", dtype=np.float32)
+    except ValueError:
+        # Keep a small compatibility fallback for whitespace-delimited files.
+        points = np.loadtxt(filepath, dtype=np.float32)
+
+    points = np.atleast_2d(points).astype(np.float32, copy=False)
+    if points.shape[1] < 3:
+        raise ValueError(f"Expected at least xyz columns in {filepath}, got {points.shape}")
+    return points
+
+
+def read_pointcloud(filepath: str) -> np.ndarray:
+    """Read a point cloud from .off or .txt format."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".off":
+        return read_off(filepath)
+    if ext == ".txt":
+        return read_txt(filepath)
+    raise ValueError(f"Unsupported point cloud file extension: {filepath}")
+
+
 class ModelNet40Dataset(Dataset):
     """ModelNet40 point cloud classification dataset.
 
-    Expects directory structure:
+    Supports split OFF/TXT layout:
         root/
             airplane/
                 train/
@@ -120,6 +156,12 @@ class ModelNet40Dataset(Dataset):
                     airplane_0001.off
                     ...
             ...
+
+    Also supports unsplit Pointcept TXT layout:
+        root/
+            airplane/
+                airplane_0001.txt
+                ...
     """
 
     def __init__(
@@ -139,6 +181,13 @@ class ModelNet40Dataset(Dataset):
             augment: Whether to apply data augmentation.
         """
         super().__init__()
+        if split not in ("train", "test"):
+            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
+        if num_points <= 0:
+            raise ValueError(f"num_points must be positive, got {num_points}")
+        if not os.path.isdir(root):
+            raise FileNotFoundError(f"Dataset root not found: {root}")
+
         self.root = root
         self.split = split
         self.num_points = num_points
@@ -146,10 +195,13 @@ class ModelNet40Dataset(Dataset):
         self.augment_flag = augment
 
         # Get sorted class names
-        self.classes = sorted([
+        self.classes = sorted(
             d for d in os.listdir(root)
             if os.path.isdir(os.path.join(root, d))
-        ])
+            and not d.startswith("_")
+            and not d.startswith(".")
+            and d != "__MACOSX"
+        )
         if len(self.classes) != 40:
             print(
                 f"WARNING: Found {len(self.classes)} class directories in {root}, "
@@ -160,22 +212,40 @@ class ModelNet40Dataset(Dataset):
         # Collect all file paths and labels
         self.filepaths = []
         self.labels = []
+        self.layout = "split" if self._has_explicit_split() else "unsplit"
 
         for cls_name in self.classes:
-            cls_dir = os.path.join(root, cls_name, split)
-            if not os.path.isdir(cls_dir):
-                print(f"WARNING: Directory not found: {cls_dir}")
-                continue
-            for fname in sorted(os.listdir(cls_dir)):
-                if fname.endswith(".off"):
-                    self.filepaths.append(os.path.join(cls_dir, fname))
-                    self.labels.append(self.class_to_idx[cls_name])
+            if self.layout == "split":
+                cls_dir = os.path.join(root, cls_name, split)
+                if not os.path.isdir(cls_dir):
+                    print(f"WARNING: Directory not found: {cls_dir}")
+                    continue
+                paths = _list_point_files(cls_dir)
+            else:
+                cls_dir = os.path.join(root, cls_name)
+                paths = _list_point_files(cls_dir)
+                split_idx = int(len(paths) * 0.8)
+                if split == "train":
+                    paths = paths[:split_idx]
+                else:
+                    paths = paths[split_idx:]
+
+            for path in paths:
+                self.filepaths.append(path)
+                self.labels.append(self.class_to_idx[cls_name])
 
         if len(self.filepaths) == 0:
             raise RuntimeError(
-                f"No .off files found in {root}/*/ {split}/. "
-                f"Check the dataset extraction."
+                f"No .off or .txt files found for split={split!r} in {root} "
+                f"using {self.layout} layout. Check the dataset extraction."
             )
+
+    def _has_explicit_split(self) -> bool:
+        return any(
+            os.path.isdir(os.path.join(self.root, cls_name, "train"))
+            or os.path.isdir(os.path.join(self.root, cls_name, "test"))
+            for cls_name in self.classes
+        )
 
     def __len__(self) -> int:
         return len(self.filepaths)
@@ -184,9 +254,18 @@ class ModelNet40Dataset(Dataset):
         filepath = self.filepaths[idx]
         label = self.labels[idx]
 
-        # Read points (N, 6): xyz + normals
-        vertices = read_off(filepath)  # (N, 6)
-        points = torch.from_numpy(vertices)  # (N, 6)
+        # Read points and keep a stable internal shape: xyz plus optional normals.
+        vertices = read_pointcloud(filepath)
+        points = torch.from_numpy(vertices.astype(np.float32, copy=False))
+        if points.ndim != 2 or points.shape[1] < 3:
+            raise ValueError(f"Expected point cloud with shape (N, >=3), got {points.shape}")
+        if points.shape[0] == 0:
+            raise ValueError(f"Empty point cloud: {filepath}")
+        if points.shape[1] < 6:
+            pad = torch.zeros(points.shape[0], 6 - points.shape[1], dtype=points.dtype)
+            points = torch.cat([points, pad], dim=1)
+        elif points.shape[1] > 6:
+            points = points[:, :6]
 
         # FPS sampling
         if points.shape[0] >= self.num_points:
@@ -215,3 +294,12 @@ class ModelNet40Dataset(Dataset):
             out = points[:, :3]  # (npoints, 3)
 
         return out, label
+
+
+def _list_point_files(directory: str) -> list[str]:
+    return [
+        os.path.join(directory, fname)
+        for fname in sorted(os.listdir(directory))
+        if os.path.isfile(os.path.join(directory, fname))
+        and fname.lower().endswith(POINT_EXTENSIONS)
+    ]

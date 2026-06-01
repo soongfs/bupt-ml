@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend
@@ -29,6 +30,8 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    if torch.backends.mps.is_available() and hasattr(torch, "mps"):
+        torch.mps.manual_seed(seed)
 
 
 def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
@@ -51,7 +54,7 @@ def compute_class_accuracy(logits: torch.Tensor, labels: torch.Tensor, num_class
     return float(np.mean(acc_per_class))
 
 
-def evaluate(model, dataloader, device, num_classes=40):
+def evaluate(model, dataloader, device, num_classes=40, desc: str = "Evaluating"):
     """Evaluate model on a dataloader.
 
     Returns:
@@ -63,10 +66,10 @@ def evaluate(model, dataloader, device, num_classes=40):
     all_labels = []
 
     with torch.no_grad():
-        for points, labels in dataloader:
+        for points, labels in tqdm(dataloader, desc=desc, leave=False):
             points, labels = points.to(device), labels.to(device)
             # Dataset returns (B, N, C) — transpose to (B, C, N)
-            points = points.transpose(2, 1)
+            points = points.transpose(2, 1).contiguous()
             logits = model(points)
             all_logits.append(logits.cpu())
             all_labels.append(labels.cpu())
@@ -106,7 +109,8 @@ def train_model(config_path: str, overrides: dict | None = None):
     print(f"{'='*60}")
 
     # Set seed
-    set_seed(config.get("seed", 42))
+    seed = config.get("seed", 42)
+    set_seed(seed)
 
     # Device
     if torch.cuda.is_available():
@@ -134,22 +138,35 @@ def train_model(config_path: str, overrides: dict | None = None):
         augment=False,
     )
 
-    print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+    print(
+        f"Dataset layout: {train_dataset.layout}; "
+        f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}"
+    )
+
+    num_workers = config.get("num_workers", 4)
+    pin_memory = device.type == "cuda"
+    generator = torch.Generator()
+    generator.manual_seed(seed)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.get("batch_size", 32),
         shuffle=True,
-        num_workers=config.get("num_workers", 4),
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         drop_last=True,
+        worker_init_fn=_seed_worker,
+        generator=generator,
+        persistent_workers=num_workers > 0,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config.get("batch_size", 32),
         shuffle=False,
-        num_workers=config.get("num_workers", 4),
-        pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        persistent_workers=num_workers > 0,
     )
 
     # Model
@@ -171,7 +188,9 @@ def train_model(config_path: str, overrides: dict | None = None):
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    model = nn.DataParallel(model)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel across {torch.cuda.device_count()} CUDA devices.")
+        model = nn.DataParallel(model)
     model = model.to(device)
 
     # Count parameters
@@ -232,9 +251,10 @@ def train_model(config_path: str, overrides: dict | None = None):
         total_correct = 0
         total_samples = 0
 
-        for points, labels in train_loader:
+        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
+        for points, labels in progress:
             points, labels = points.to(device), labels.to(device)
-            points = points.transpose(2, 1)  # (B, N, C) -> (B, C, N)
+            points = points.transpose(2, 1).contiguous()  # (B, N, C) -> (B, C, N)
 
             optimizer.zero_grad()
             logits = model(points)
@@ -247,15 +267,28 @@ def train_model(config_path: str, overrides: dict | None = None):
             preds = logits.argmax(dim=1)
             total_correct += (preds == labels).sum().item()
             total_samples += batch_size
+            progress.set_postfix(
+                loss=total_loss / max(total_samples, 1),
+                acc=total_correct / max(total_samples, 1),
+            )
 
         scheduler.step()
+
+        if total_samples == 0:
+            raise RuntimeError(
+                "No training samples were processed. Reduce batch_size or check the dataset."
+            )
 
         avg_loss = total_loss / total_samples
         train_inst = total_correct / total_samples
 
         # Evaluate
-        train_eval_inst, train_eval_class = evaluate(model, train_loader, device)
-        test_inst, test_class = evaluate(model, test_loader, device)
+        train_eval_inst, train_eval_class = evaluate(
+            model, train_loader, device, desc="Train eval"
+        )
+        test_inst, test_class = evaluate(
+            model, test_loader, device, desc="Test eval"
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
 
@@ -285,7 +318,7 @@ def train_model(config_path: str, overrides: dict | None = None):
             best_epoch = epoch
             torch.save(
                 {
-                    "model_state_dict": model.module.state_dict(),
+                    "model_state_dict": _unwrap_model(model).state_dict(),
                     "config": config,
                     "epoch": epoch,
                     "best_inst_acc": best_inst_acc,
@@ -305,7 +338,7 @@ def train_model(config_path: str, overrides: dict | None = None):
     # Save last checkpoint
     torch.save(
         {
-            "model_state_dict": model.module.state_dict(),
+            "model_state_dict": _unwrap_model(model).state_dict(),
             "config": config,
             "epoch": epochs,
             "best_inst_acc": best_inst_acc,
@@ -318,6 +351,16 @@ def train_model(config_path: str, overrides: dict | None = None):
     _plot_curves(history, output_dir)
 
     return best_inst_acc, best_class_acc
+
+
+def _seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 def _plot_curves(history: dict, output_dir: str):

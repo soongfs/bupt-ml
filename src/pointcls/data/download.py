@@ -4,101 +4,77 @@ import os
 import ssl
 import tarfile
 import urllib.request
-import zipfile
 import sys
-import shutil
 
-# Primary: HuggingFace (Pointcept mirror), Secondary: Stanford official
-HF_URL = "https://huggingface.co/datasets/Pointcept/modelnet40_normal_resampled-compressed/resolve/main/modelnet40_normal_resampled.tar.gz"
-STANFORD_URL = "https://shapenet.cs.stanford.edu/media/modelnet40_normal_resampled.zip"
+# HuggingFace Pointcept mirror. This tarball extracts directly into per-class
+# directories containing CSV-style .txt point clouds.
+HF_URL = (
+    "https://huggingface.co/datasets/Pointcept/"
+    "modelnet40_normal_resampled-compressed/resolve/main/"
+    "modelnet40_normal_resampled.tar.gz"
+)
 DEFAULT_DATA_DIR = "data/modelnet40"
 
-_URLS = [HF_URL, STANFORD_URL]
+POINT_EXTENSIONS = (".off", ".txt")
 
 
 def verify_modelnet40(data_dir: str) -> bool:
     if not os.path.isdir(data_dir):
         return False
-    subdirs = [d for d in os.listdir(data_dir)
-               if os.path.isdir(os.path.join(data_dir, d))]
-    return len(subdirs) == 40
+    subdirs = [
+        d for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d))
+        and not d.startswith("_")
+        and not d.startswith(".")
+        and d != "__MACOSX"
+    ]
+    if len(subdirs) != 40:
+        return False
+    return all(_class_has_point_files(os.path.join(data_dir, d)) for d in subdirs)
 
 
 def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
     os.makedirs(data_dir, exist_ok=True)
 
     if verify_modelnet40(data_dir):
+        _remove_download_artifacts(data_dir)
         print(f"ModelNet40 already exists at {data_dir} (40 class directories found).")
         return
 
     archive_path = os.path.join(data_dir, "_dl_archive")
-    archive_is_tar = False  # track format
+    partial_path = f"{archive_path}.part"
 
     # Download
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
+
+    if os.path.exists(archive_path) and not tarfile.is_tarfile(archive_path):
+        print(f"Removing invalid archive artifact: {archive_path}")
+        os.remove(archive_path)
+
     if not os.path.exists(archive_path):
-        last_error = None
-        for url in _URLS:
-            try:
-                print(f"Downloading {url} ...")
-                _download(url, archive_path)
-                archive_is_tar = url.endswith(".tar.gz")
-                break
-            except Exception as e:
-                last_error = e
-                print(f"  Failed ({e}), trying next...")
-        else:
-            print(f"\nAll download sources failed. Last error: {last_error}")
-            print(f"Please download manually from Baidu Pan:")
-            print(f"  https://pan.baidu.com/s/1vHN3ECUT76NxFsJzne5RAQ  pwd: 2026")
-            print(f"Place the zip at: {archive_path}")
+        try:
+            print(f"Downloading {HF_URL} ...")
+            _download(HF_URL, partial_path)
+            os.replace(partial_path, archive_path)
+        except Exception as e:
+            if os.path.exists(partial_path):
+                os.remove(partial_path)
+            print(f"\nDownload failed: {e}")
+            print("Please download the tar.gz manually and place it at:")
+            print(f"  {archive_path}")
             return
     else:
         print(f"Archive already downloaded: {archive_path}")
-        # Auto-detect format: try tar.gz first, then zip
-        try:
-            with tarfile.open(archive_path, "r:gz") as tf:
-                pass
-            archive_is_tar = True
-        except tarfile.ReadError:
-            archive_is_tar = False
 
     # Extract
     print(f"Extracting to {data_dir} ...")
-    if archive_is_tar:
-        with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(data_dir)
-    else:
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(data_dir)
+    with tarfile.open(archive_path, "r:gz") as tf:
+        _safe_extract(tf, data_dir)
     print("  Done.")
 
-    # Flatten: if extracted content is inside a single subdirectory,
-    # move everything up one level
-    items = os.listdir(data_dir)
-    files_and_dirs = [i for i in items if os.path.isfile(os.path.join(data_dir, i)) or
-                      os.path.isdir(os.path.join(data_dir, i))]
-    nested = [i for i in items if os.path.isdir(os.path.join(data_dir, i))
-              and i not in ("_dl_archive",)]
-
-    # If everything is in one subdirectory, flatten
-    if len(nested) == 1 and len(files_and_dirs) == len(nested) + (1 if os.path.exists(archive_path) else 0):
-        inner = os.path.join(data_dir, nested[0])
-        for item in os.listdir(inner):
-            src = os.path.join(inner, item)
-            dst = os.path.join(data_dir, item)
-            if os.path.exists(dst):
-                if os.path.isdir(dst):
-                    shutil.rmtree(dst)
-                else:
-                    os.remove(dst)
-            shutil.move(src, dst)
-        os.rmdir(inner)
-        print("  Flattened directory structure.")
-
     # Clean up archive
-    if os.path.exists(archive_path):
-        os.remove(archive_path)
-        print("  Removed archive file.")
+    _remove_download_artifacts(data_dir)
 
     if verify_modelnet40(data_dir):
         print(f"ModelNet40 ready at {data_dir} (40 class directories).")
@@ -110,6 +86,11 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
 
 def _download(url: str, dest: str):
     def _progress(count, block_size, total_size):
+        if total_size <= 0:
+            downloaded = count * block_size / (1024 * 1024)
+            sys.stdout.write(f"\r  Downloaded {downloaded:.1f} MiB")
+            sys.stdout.flush()
+            return
         pct = min(100, int(count * block_size * 100 / total_size))
         filled = int(40 * pct / 100)
         bar = "=" * filled + "-" * (40 - filled)
@@ -134,6 +115,39 @@ def _download(url: str, dest: str):
                 pass  # retry without verification
             else:
                 raise
+
+
+def _class_has_point_files(class_dir: str) -> bool:
+    for fname in os.listdir(class_dir):
+        fpath = os.path.join(class_dir, fname)
+        if os.path.isfile(fpath) and fname.lower().endswith(POINT_EXTENSIONS):
+            return True
+
+    for split in ("train", "test"):
+        split_dir = os.path.join(class_dir, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for fname in os.listdir(split_dir):
+            if fname.lower().endswith(POINT_EXTENSIONS):
+                return True
+    return False
+
+
+def _safe_extract(tf: tarfile.TarFile, dest: str):
+    dest_abs = os.path.abspath(dest)
+    for member in tf.getmembers():
+        target = os.path.abspath(os.path.join(dest, member.name))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
+            raise RuntimeError(f"Unsafe path in archive: {member.name}")
+    tf.extractall(dest)
+
+
+def _remove_download_artifacts(data_dir: str):
+    for name in ("_dl_archive", "_dl_archive.part"):
+        path = os.path.join(data_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"  Removed {name}.")
 
 
 if __name__ == "__main__":

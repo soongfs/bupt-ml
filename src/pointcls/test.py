@@ -22,18 +22,23 @@ def run_test(
     Args:
         checkpoint_path: Path to model checkpoint (.pth).
         test_dir: Directory containing test data.
-            - If it contains .off files in subdirectories, use dataset loader.
+            - If it contains .off/.txt files in subdirectories, use dataset loader.
             - If it contains .npy files, load them directly.
         output_path: Path to output CSV file.
         num_votes: Number of random rotations for voting.
         batch_size: Batch size for inference.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # Load checkpoint
     print(f"Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config", {})
 
     best_acc = checkpoint.get("best_inst_acc", "N/A")
@@ -69,12 +74,22 @@ def run_test(
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint["model_state_dict"]
+    if state_dict and all(k.startswith("module.") for k in state_dict):
+        state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
     # Load test data
-    test_samples, sample_ids = _load_test_data(test_dir, device)
+    use_normals = config.get("use_normals", False)
+    num_points = config.get("num_points", 1024)
+    test_samples, sample_ids = _load_test_data(
+        test_dir,
+        device,
+        num_points=num_points,
+        use_normals=use_normals,
+    )
     print(f"Test samples: {len(test_samples)}")
 
     # Class names (alphabetically sorted, same as dataset)
@@ -97,10 +112,21 @@ def run_test(
             rotated = _random_rotate(points, seed=i * 1000 + v)
 
             # Normalize
-            rotated = normalize_pointcloud(rotated)
+            rotated = rotated.clone()
+            rotated[:, :3] = normalize_pointcloud(rotated[:, :3])
+            if not use_normals:
+                rotated = rotated[:, :3]
+            elif rotated.shape[1] < 6:
+                pad = torch.zeros(
+                    rotated.shape[0],
+                    6 - rotated.shape[1],
+                    dtype=rotated.dtype,
+                    device=rotated.device,
+                )
+                rotated = torch.cat([rotated, pad], dim=1)
 
             # Prepare batch (1, 3, N)
-            batch = rotated.unsqueeze(0).transpose(2, 1)  # (1, 3, N)
+            batch = rotated.unsqueeze(0).transpose(2, 1).contiguous()  # (1, C, N)
 
             with torch.no_grad():
                 logits = model(batch)  # (1, 40)
@@ -130,15 +156,20 @@ def run_test(
     print(f"Results saved to: {output_path}")
 
 
-def _load_test_data(test_dir: str, device: torch.device):
+def _load_test_data(
+    test_dir: str,
+    device: torch.device,
+    num_points: int = 1024,
+    use_normals: bool = False,
+):
     """Load test data from directory.
 
     Returns:
-        test_samples: list of (N, 3) tensors on device.
+        test_samples: list of (N, C) tensors on device.
         sample_ids: list of sample identifiers.
     """
     import torch
-    from pointcls.data.dataset import read_off, normalize_pointcloud, farthest_point_sample
+    from pointcls.data.dataset import read_pointcloud
 
     test_samples = []
     sample_ids = []
@@ -149,36 +180,70 @@ def _load_test_data(test_dir: str, device: torch.device):
         print(f"Found {len(npy_files)} .npy files")
         for i, fname in enumerate(npy_files):
             data = np.load(os.path.join(test_dir, fname))
-            points = torch.from_numpy(data.astype(np.float32)).to(device)
-            if points.shape[1] > 3:
-                points = points[:, :3]
+            points = _prepare_points(data, device, num_points, use_normals)
             test_samples.append(points)
             sample_ids.append(fname.replace(".npy", ""))
         return test_samples, sample_ids
 
-    # Check for .off files
-    off_files = []
+    # Check for .off/.txt files
+    point_files = []
     for root, dirs, files in os.walk(test_dir):
         for fname in sorted(files):
-            if fname.endswith(".off"):
-                off_files.append(os.path.join(root, fname))
+            if fname.lower().endswith((".off", ".txt")):
+                point_files.append(os.path.join(root, fname))
+    point_files = sorted(point_files)
 
-    if off_files:
-        print(f"Found {len(off_files)} .off files")
-        for fpath in off_files:
-            vertices = read_off(fpath)
-            points = torch.from_numpy(vertices[:, :3]).to(device)
-            # FPS to 1024 if more points
-            if points.shape[0] > 1024:
-                batch = points.unsqueeze(0)
-                fps_idx = farthest_point_sample(batch, 1024).squeeze(0)
-                points = points[fps_idx]
-            points = normalize_pointcloud(points)
+    if point_files:
+        print(f"Found {len(point_files)} .off/.txt files")
+        for fpath in point_files:
+            vertices = read_pointcloud(fpath)
+            points = _prepare_points(vertices, device, num_points, use_normals)
             test_samples.append(points)
             sample_ids.append(os.path.splitext(os.path.basename(fpath))[0])
         return test_samples, sample_ids
 
-    raise FileNotFoundError(f"No .off or .npy files found in {test_dir}")
+    raise FileNotFoundError(f"No .off, .txt, or .npy files found in {test_dir}")
+
+
+def _prepare_points(
+    data: np.ndarray,
+    device: torch.device,
+    num_points: int,
+    use_normals: bool,
+) -> torch.Tensor:
+    from pointcls.data.dataset import farthest_point_sample, normalize_pointcloud
+
+    data = np.atleast_2d(data).astype(np.float32, copy=False)
+    if data.shape[1] < 3:
+        raise ValueError(f"Expected at least xyz columns, got shape {data.shape}")
+    if data.shape[0] == 0:
+        raise ValueError("Empty point cloud")
+
+    points = torch.from_numpy(data).to(device)
+    if points.shape[1] > 6:
+        points = points[:, :6]
+    if use_normals and points.shape[1] < 6:
+        pad = torch.zeros(
+            points.shape[0],
+            6 - points.shape[1],
+            dtype=points.dtype,
+            device=points.device,
+        )
+        points = torch.cat([points, pad], dim=1)
+    elif not use_normals:
+        points = points[:, :3]
+
+    if points.shape[0] > num_points:
+        batch = points[:, :3].unsqueeze(0)
+        fps_idx = farthest_point_sample(batch, num_points).squeeze(0)
+        points = points[fps_idx]
+    elif points.shape[0] < num_points:
+        repeat = num_points // points.shape[0] + 1
+        points = points.repeat(repeat, 1)[:num_points]
+
+    points = points.clone()
+    points[:, :3] = normalize_pointcloud(points[:, :3])
+    return points
 
 
 def _get_class_names(test_dir: str):
@@ -226,12 +291,12 @@ def _random_rotate(points: torch.Tensor, seed: int) -> torch.Tensor:
 
     # Use a local random state with the given seed
     rng = np.random.RandomState(seed)
-    # Rotation.random() uses global numpy random; set state temporarily
-    old_state = np.random.get_state()
-    np.random.seed(seed)
     R = torch.from_numpy(
-        Rotation.random().as_matrix().astype(np.float32)
+        Rotation.random(random_state=rng).as_matrix().astype(np.float32)
     ).to(points.device)
-    np.random.set_state(old_state)
 
-    return points @ R.T
+    rotated = points.clone()
+    rotated[:, :3] = points[:, :3] @ R.T
+    if points.shape[1] >= 6:
+        rotated[:, 3:6] = points[:, 3:6] @ R.T
+    return rotated
