@@ -39,6 +39,8 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
 
     print(f"Downloading {HF_REPO} from HuggingFace...")
     try:
+        # Use hf-mirror.com in China for better speed/stability
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         from huggingface_hub import snapshot_download
         snapshot_download(
             repo_id=HF_REPO,
