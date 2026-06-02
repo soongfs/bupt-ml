@@ -168,14 +168,37 @@ def _load_test_data(
         test_samples: list of (N, C) tensors on device.
         sample_ids: list of sample identifiers.
     """
-    import torch
-    from pointcls.data.dataset import read_pointcloud
-
     test_samples = []
     sample_ids = []
 
+    if _has_modelnet_test_split(test_dir):
+        from pointcls.data.dataset import ModelNet40Dataset
+
+        try:
+            dataset = ModelNet40Dataset(
+                root=test_dir,
+                split="test",
+                num_points=num_points,
+                use_normals=use_normals,
+                augment=False,
+                preload=False,
+            )
+        except RuntimeError as exc:
+            print(f"Could not load ModelNet40 test split: {exc}")
+        else:
+            print(f"Found {len(dataset)} ModelNet40 test files")
+            for i in range(len(dataset)):
+                points, _ = dataset[i]
+                test_samples.append(points.to(device))
+                sample_ids.append(os.path.splitext(os.path.basename(dataset.filepaths[i]))[0])
+            return test_samples, sample_ids
+
     # Check for .npy files
-    npy_files = sorted([f for f in os.listdir(test_dir) if f.endswith(".npy")])
+    npy_files = sorted([
+        f for f in os.listdir(test_dir)
+        if f.lower().endswith(".npy")
+        and os.path.isfile(os.path.join(test_dir, f))
+    ])
     if npy_files:
         print(f"Found {len(npy_files)} .npy files")
         for i, fname in enumerate(npy_files):
@@ -196,13 +219,37 @@ def _load_test_data(
     if point_files:
         print(f"Found {len(point_files)} .off/.txt files")
         for fpath in point_files:
-            vertices = read_pointcloud(fpath)
+            vertices = _read_point_file(fpath)
             points = _prepare_points(vertices, device, num_points, use_normals)
             test_samples.append(points)
             sample_ids.append(os.path.splitext(os.path.basename(fpath))[0])
         return test_samples, sample_ids
 
     raise FileNotFoundError(f"No .off, .txt, or .npy files found in {test_dir}")
+
+
+def _has_modelnet_test_split(test_dir: str) -> bool:
+    """Return True when root/class/test directories are present."""
+    if not os.path.isdir(test_dir):
+        return False
+    for cls_name in os.listdir(test_dir):
+        if cls_name.startswith((".", "_")) or cls_name == "__MACOSX":
+            continue
+        split_dir = os.path.join(test_dir, cls_name, "test")
+        if os.path.isdir(split_dir):
+            return True
+    return False
+
+
+def _read_point_file(filepath: str) -> np.ndarray:
+    from pointcls.data.dataset import read_off, read_txt
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".off":
+        return read_off(filepath)
+    if ext == ".txt":
+        return read_txt(filepath)
+    raise ValueError(f"Unsupported point cloud file extension: {filepath}")
 
 
 def _prepare_points(
