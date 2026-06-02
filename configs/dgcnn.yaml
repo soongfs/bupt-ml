@@ -3,7 +3,7 @@ num_points: 1024
 use_normals: false
 k: 20
 dropout: 0.5
-batch_size: 256
+batch_size: 128
 epochs: 250
 optimizer: Adam
 lr: 0.001
