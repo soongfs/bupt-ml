@@ -44,8 +44,6 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
             repo_id=HF_REPO,
             repo_type="dataset",
             local_dir=data_dir,
-            local_dir_use_symlinks=False,
-            resume_download=True,
         )
     except ImportError:
         print("huggingface_hub not installed. Run: uv add huggingface_hub")
