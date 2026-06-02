@@ -16,6 +16,7 @@ dependencies = [
     "h5py>=3.8",
     "scipy>=1.10",
     "tqdm>=4.65",
+    "huggingface-hub>=0.20",
 ]
 
 [project.scripts]
