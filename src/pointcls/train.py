@@ -94,6 +94,8 @@ def train_model(config_path: str, overrides: dict | None = None):
     Returns:
         Tuple of (best_inst_acc, best_class_acc).
     """
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
     # Load config
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
@@ -152,6 +154,11 @@ def train_model(config_path: str, overrides: dict | None = None):
         use_normals=config.get("use_normals", False),
         augment=False,
     )
+
+    if _gpu_reservation is not None:
+        del _gpu_reservation
+        torch.cuda.empty_cache()
+        print("Released GPU memory reservation before training.")
 
     print(
         f"Dataset layout: {train_dataset.layout}; "
@@ -565,5 +572,5 @@ def _reserve_gpu_memory(mb: int):
     from claiming the GPU during long CPU preloads."""
     elements = (mb * 1024 * 1024) // 4  # float32 = 4 bytes
     t = torch.zeros(elements, dtype=torch.float32, device="cuda")
-    print(f"Reserved {mb} MiB GPU memory (kept for entire training duration).")
+    print(f"Reserved {mb} MiB GPU memory during data preload.")
     return t

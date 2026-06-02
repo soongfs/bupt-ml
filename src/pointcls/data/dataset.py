@@ -303,6 +303,10 @@ class ModelNet40Dataset(Dataset):
 
             pts[:, :3] = normalize_pointcloud(pts[:, :3])
             cached.append((pts, lbl))
+
+        if gpu:
+            torch.cuda.empty_cache()
+
         return cached
 
     def __len__(self) -> int:
