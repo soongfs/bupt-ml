@@ -254,34 +254,41 @@ class ModelNet40Dataset(Dataset):
         )
 
     def _preload_all(self) -> list:
-        """Pre-FPS and pre-normalize all samples into memory.
-        
-        This eliminates per-__getitem__ FPS overhead. Augmentation is still
-        applied on-the-fly since it must differ each epoch.
-        Returns list of (points, label) tuples with points as (N, 6) tensors.
+        """Pre-FPS and pre-normalize all samples into memory (multi-threaded I/O).
+
+        Phase 1: read all files in parallel via thread pool.
+        Phase 2: FPS + normalize (GPU-accelerated if CUDA available).
         """
         from tqdm.auto import tqdm
-        
-        # Use GPU for FPS if available (much faster than CPU)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         gpu = torch.device("cuda") if torch.cuda.is_available() else None
-        
+        total = len(self.filepaths)
+        raw_data = [None] * total
+
+        # Phase 1: parallel file I/O
+        print(f"Reading {total} {self.split} files (parallel)...")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_read_one_sample, fp): i
+                       for i, fp in enumerate(self.filepaths)}
+            for fut in tqdm(as_completed(futures), total=total,
+                            desc=f"Reading {self.split}"):
+                i = futures[fut]
+                raw_data[i] = fut.result()
+
+        # Phase 2: FPS + normalize on GPU
+        print(f"FPS + normalize on {'GPU' if gpu else 'CPU'}...")
         cached = []
-        print(f"Preloading {len(self.filepaths)} {self.split} samples into memory..."
-              + (f" (GPU-accelerated)" if gpu else ""))
-        for fp, lbl in tqdm(zip(self.filepaths, self.labels), total=len(self.filepaths),
-                             desc=f"Preloading {self.split}"):
-            vertices = read_pointcloud(fp)
-            pts = torch.from_numpy(vertices.astype(np.float32, copy=False))
-            if pts.ndim != 2 or pts.shape[1] < 3:
-                raise ValueError(f"Bad shape: {pts.shape} in {fp}")
+        for i, (pts, lbl) in enumerate(tqdm(zip(raw_data, self.labels), total=total,
+                                              desc=f"Processing {self.split}")):
+            pts = torch.from_numpy(pts)
             if pts.shape[1] < 6:
                 pad = torch.zeros(pts.shape[0], 6 - pts.shape[1], dtype=pts.dtype)
                 pts = torch.cat([pts, pad], dim=1)
             elif pts.shape[1] > 6:
                 pts = pts[:, :6]
 
-            # FPS on GPU if available, fall back to CPU
-            if gpu:
+            if gpu and pts.shape[0] >= self.num_points:
                 pts_gpu = pts.to(gpu)
                 pts_b = pts_gpu.unsqueeze(0)
                 idx = farthest_point_sample(pts_b[:, :, :3], self.num_points).squeeze(0)
@@ -294,7 +301,6 @@ class ModelNet40Dataset(Dataset):
                 repeat = self.num_points // pts.shape[0] + 1
                 pts = pts.repeat(repeat, 1)[:self.num_points]
 
-            # Normalize xyz only
             pts[:, :3] = normalize_pointcloud(pts[:, :3])
             cached.append((pts, lbl))
         return cached
@@ -354,3 +360,8 @@ def _list_point_files(directory: str) -> list[str]:
         if os.path.isfile(os.path.join(directory, fname))
         and fname.lower().endswith(POINT_EXTENSIONS)
     ]
+
+
+def _read_one_sample(filepath: str) -> np.ndarray:
+    """Read a single point cloud file and return numpy array (N, >=3)."""
+    return read_pointcloud(filepath).astype(np.float32, copy=False)
