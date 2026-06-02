@@ -14,3 +14,4 @@ num_workers: 0
 prefetch_factor: 2
 seed: 42
 elite: true
+gpu_reserve_mb: 35000

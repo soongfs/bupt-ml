@@ -122,11 +122,20 @@ def train_model(config_path: str, overrides: dict | None = None):
     # Device
     if torch.cuda.is_available():
         device = torch.device("cuda")
+        _print_cuda_info()
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
     print(f"Device: {device}")
+
+    # Reserve GPU memory BEFORE the slow CPU preload, so other users
+    # on shared machines cannot claim this GPU while we prepare data.
+    _gpu_reservation = None
+    if device.type == "cuda":
+        reserve_mb = config.get("gpu_reserve_mb", 0)
+        if reserve_mb > 0:
+            _gpu_reservation = _reserve_gpu_memory(reserve_mb)
 
     # Data
     data_dir = "data/modelnet40"
@@ -534,3 +543,28 @@ def _save_training_checkpoint(
 def _shutdown_dataloader_workers(loader):
     if hasattr(loader, "_iterator") and loader._iterator is not None:
         loader._iterator._shutdown_workers()
+
+
+def _print_cuda_info():
+    """Print free/completed memory per GPU so the user can pick a free one."""
+    if not torch.cuda.is_available():
+        return
+    print("GPU memory status:")
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        free, total = torch.cuda.mem_get_info(i)
+        used = total - free
+        pct = used / total * 100
+        print(
+            f"  GPU {i} ({props.name}): "
+            f"{used / 1024**3:.1f} / {total / 1024**3:.1f} GiB used ({pct:.0f}%)"
+        )
+
+
+def _reserve_gpu_memory(mb: int):
+    """Allocate a tensor to reserve GPU memory, preventing other processes
+    from claiming the GPU during long CPU preloads."""
+    elements = (mb * 1024 * 1024) // 4  # float32 = 4 bytes
+    t = torch.zeros(elements, dtype=torch.float32, device="cuda")
+    print(f"Reserved {mb} MiB GPU memory (kept for entire training duration).")
+    return t
