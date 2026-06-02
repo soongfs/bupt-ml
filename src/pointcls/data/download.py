@@ -31,11 +31,23 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
         print(f"ModelNet40 already exists at {data_dir}")
         return
 
-    # Remove any previous Pointcept data
-    if os.path.isdir(data_dir) and os.listdir(data_dir):
-        print("Removing old dataset...")
-        shutil.rmtree(data_dir)
-        os.makedirs(data_dir)
+    # Remove previous Pointcept data (txt format), keep partial OFF downloads
+    if os.path.isdir(data_dir):
+        has_off = any(
+            f.endswith(".off") for f in os.listdir(data_dir)
+            if os.path.isfile(os.path.join(data_dir, f))
+        )
+        has_txt = any(
+            f.endswith(".txt") for f in os.listdir(data_dir)
+            if os.path.isfile(os.path.join(data_dir, f))
+        )
+        if has_txt and not has_off:
+            print("Removing old Pointcept dataset...")
+            shutil.rmtree(data_dir)
+            os.makedirs(data_dir)
+        elif verify_modelnet40(data_dir):
+            print(f"ModelNet40 already exists at {data_dir}")
+            return
 
     print(f"Downloading {HF_REPO} from HuggingFace...")
     try:
@@ -46,6 +58,7 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
             repo_id=HF_REPO,
             repo_type="dataset",
             local_dir=data_dir,
+            max_workers=1,
         )
     except ImportError:
         print("huggingface_hub not installed. Run: uv add huggingface_hub")
