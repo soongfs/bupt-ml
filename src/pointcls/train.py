@@ -66,13 +66,14 @@ def evaluate(model, dataloader, device, num_classes=40, desc: str = "Evaluating"
     all_labels = []
 
     with torch.no_grad():
-        for points, labels in tqdm(dataloader, desc=desc, leave=False):
-            points, labels = points.to(device), labels.to(device)
-            # Dataset returns (B, N, C) — transpose to (B, C, N)
-            points = points.transpose(2, 1).contiguous()
-            logits = model(points)
-            all_logits.append(logits.cpu())
-            all_labels.append(labels.cpu())
+        with tqdm(dataloader, desc=desc, leave=False) as progress:
+            for points, labels in progress:
+                points, labels = points.to(device), labels.to(device)
+                # Dataset returns (B, N, C) — transpose to (B, C, N)
+                points = points.transpose(2, 1).contiguous()
+                logits = model(points)
+                all_logits.append(logits.cpu())
+                all_labels.append(labels.cpu())
 
     all_logits = torch.cat(all_logits, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
@@ -104,6 +105,12 @@ def train_model(config_path: str, overrides: dict | None = None):
         print(f"Config overrides applied: {overrides}")
 
     model_name = config["model"]
+    output_dir = os.path.join("runs", model_name)
+    checkpoint_path = os.path.join(output_dir, "checkpoint.pth")
+    resume_checkpoint = None
+    if os.path.exists(checkpoint_path):
+        resume_checkpoint = _load_training_checkpoint(checkpoint_path)
+
     print(f"\n{'='*60}")
     print(f"Training {model_name.upper()}")
     print(f"{'='*60}")
@@ -224,136 +231,201 @@ def train_model(config_path: str, overrides: dict | None = None):
     )
 
     # Output directory
-    output_dir = os.path.join("runs", model_name)
     os.makedirs(output_dir, exist_ok=True)
-
-    # Log file
-    log_path = os.path.join(output_dir, "log.txt")
-    log_file = open(log_path, "w")
 
     # Training tracking
     epochs = config.get("epochs", 250)
+    scheduler_t_max = config.get("scheduler_T_max", 250)
+    start_epoch = 1
     best_inst_acc = 0.0
     best_class_acc = 0.0
     best_epoch = 0
+    elapsed_time_prior = 0.0
 
-    history = {
-        "train_loss": [],
-        "train_inst_acc": [],
-        "train_class_acc": [],
-        "test_inst_acc": [],
-        "test_class_acc": [],
-    }
+    history = _initial_history()
 
-    start_time = time.time()
-
-    for epoch in range(1, epochs + 1):
-        # Training
-        model.train()
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-
-        progress = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False)
-        for points, labels in progress:
-            points, labels = points.to(device), labels.to(device)
-            points = points.transpose(2, 1).contiguous()  # (B, N, C) -> (B, C, N)
-
-            optimizer.zero_grad()
-            logits = model(points)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-
-            batch_size = labels.size(0)
-            total_loss += loss.item() * batch_size
-            preds = logits.argmax(dim=1)
-            total_correct += (preds == labels).sum().item()
-            total_samples += batch_size
-            progress.set_postfix(
-                loss=total_loss / max(total_samples, 1),
-                acc=total_correct / max(total_samples, 1),
+    if resume_checkpoint is not None:
+        _unwrap_model(model).load_state_dict(resume_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        _move_optimizer_state(optimizer, device)
+        scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+        if getattr(scheduler, "T_max", scheduler_t_max) != scheduler_t_max:
+            print(
+                "Scheduler T_max changed from "
+                f"{scheduler.T_max} to {scheduler_t_max}; continuing with updated schedule."
             )
+            scheduler.T_max = scheduler_t_max
 
-        scheduler.step()
-
-        if total_samples == 0:
-            raise RuntimeError(
-                "No training samples were processed. Reduce batch_size or check the dataset."
-            )
-
-        avg_loss = total_loss / total_samples
-        train_inst = total_correct / total_samples
-
-        # Evaluate
-        train_eval_inst, train_eval_class = evaluate(
-            model, train_loader, device, desc="Train eval"
+        checkpoint_epoch = int(resume_checkpoint["epoch"])
+        start_epoch = checkpoint_epoch + 1
+        best_inst_acc = float(resume_checkpoint.get("best_inst_acc", best_inst_acc))
+        best_class_acc = float(resume_checkpoint.get("best_class_acc", best_class_acc))
+        history = _normalize_history(resume_checkpoint.get("history", {}))
+        best_epoch = int(
+            resume_checkpoint.get("best_epoch")
+            or _infer_best_epoch(history, fallback=checkpoint_epoch)
         )
-        test_inst, test_class = evaluate(
-            model, test_loader, device, desc="Test eval"
-        )
+        elapsed_time_prior = float(resume_checkpoint.get("elapsed_time_total", 0.0))
+        print(f"Resuming from epoch {start_epoch} (best_inst_acc={best_inst_acc:.4f})")
 
-        current_lr = optimizer.param_groups[0]["lr"]
-
-        # Log
-        log_line = (
-            f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | "
-            f"Train Acc: {train_eval_inst:.4f} | "
-            f"Test Inst Acc: {test_inst:.4f} | "
-            f"Test Class Acc: {test_class:.4f} | "
-            f"LR: {current_lr:.6f}"
+    # Log file
+    log_path = os.path.join(output_dir, "log.txt")
+    log_file = open(log_path, "a" if resume_checkpoint is not None else "w")
+    if resume_checkpoint is not None:
+        log_file.write(
+            f"\nResuming from epoch {start_epoch} "
+            f"(best_inst_acc={best_inst_acc:.4f})\n"
         )
-        print(log_line)
-        log_file.write(log_line + "\n")
         log_file.flush()
 
-        # Track history
-        history["train_loss"].append(avg_loss)
-        history["train_inst_acc"].append(train_eval_inst)
-        history["train_class_acc"].append(train_eval_class)
-        history["test_inst_acc"].append(test_inst)
-        history["test_class_acc"].append(test_class)
+    start_time = time.time()
+    last_completed_epoch = start_epoch - 1
 
-        # Save best
-        if test_inst > best_inst_acc:
-            best_inst_acc = test_inst
-            best_class_acc = test_class
-            best_epoch = epoch
-            torch.save(
-                {
-                    "model_state_dict": _unwrap_model(model).state_dict(),
-                    "config": config,
-                    "epoch": epoch,
-                    "best_inst_acc": best_inst_acc,
-                    "best_class_acc": best_class_acc,
-                },
-                os.path.join(output_dir, "best.pth"),
+    try:
+        for epoch in range(start_epoch, epochs + 1):
+            # Training
+            model.train()
+            total_loss = 0.0
+            total_correct = 0
+            total_samples = 0
+
+            with tqdm(
+                train_loader, desc=f"Epoch {epoch}/{epochs}", leave=False
+            ) as progress:
+                for points, labels in progress:
+                    points, labels = points.to(device), labels.to(device)
+                    points = points.transpose(2, 1).contiguous()  # (B, N, C) -> (B, C, N)
+
+                    optimizer.zero_grad()
+                    logits = model(points)
+                    loss = criterion(logits, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                    batch_size = labels.size(0)
+                    total_loss += loss.item() * batch_size
+                    preds = logits.argmax(dim=1)
+                    total_correct += (preds == labels).sum().item()
+                    total_samples += batch_size
+                    progress.set_postfix(
+                        loss=total_loss / max(total_samples, 1),
+                        acc=total_correct / max(total_samples, 1),
+                    )
+
+            scheduler.step()
+
+            if total_samples == 0:
+                raise RuntimeError(
+                    "No training samples were processed. Reduce batch_size or check the dataset."
+                )
+
+            avg_loss = total_loss / total_samples
+            train_inst = total_correct / total_samples
+
+            # Evaluate
+            train_eval_inst, train_eval_class = evaluate(
+                model, train_loader, device, desc="Train eval"
             )
-            print(f"  -> New best model saved! (inst_acc: {best_inst_acc:.4f})")
+            test_inst, test_class = evaluate(
+                model, test_loader, device, desc="Test eval"
+            )
 
-    elapsed = time.time() - start_time
-    print(f"\nTraining complete in {elapsed / 60:.1f} minutes.")
-    print(f"Best: Epoch {best_epoch}, Inst Acc: {best_inst_acc:.4f}, Class Acc: {best_class_acc:.4f}")
+            current_lr = optimizer.param_groups[0]["lr"]
 
-    log_file.write(f"\nBest: Epoch {best_epoch}, Inst Acc: {best_inst_acc:.4f}, Class Acc: {best_class_acc:.4f}\n")
-    log_file.close()
+            # Log
+            log_line = (
+                f"Epoch {epoch:3d} | Loss: {avg_loss:.4f} | "
+                f"Train Acc: {train_eval_inst:.4f} | "
+                f"Test Inst Acc: {test_inst:.4f} | "
+                f"Test Class Acc: {test_class:.4f} | "
+                f"LR: {current_lr:.6f}"
+            )
+            print(log_line)
+            log_file.write(log_line + "\n")
+            log_file.flush()
 
-    # Save last checkpoint
-    torch.save(
-        {
-            "model_state_dict": _unwrap_model(model).state_dict(),
-            "config": config,
-            "epoch": epochs,
-            "best_inst_acc": best_inst_acc,
-            "best_class_acc": best_class_acc,
-        },
-        os.path.join(output_dir, "last.pth"),
-    )
+            # Track history
+            history["train_loss"].append(avg_loss)
+            history["train_acc"].append(train_eval_inst)
+            history["train_inst_acc"].append(train_eval_inst)
+            history["train_class_acc"].append(train_eval_class)
+            history["test_inst_acc"].append(test_inst)
+            history["test_class_acc"].append(test_class)
 
-    # Plot training curves
-    _plot_curves(history, output_dir)
+            # Save best
+            if test_inst > best_inst_acc:
+                best_inst_acc = test_inst
+                best_class_acc = test_class
+                best_epoch = epoch
+                torch.save(
+                    {
+                        "model_state_dict": _unwrap_model(model).state_dict(),
+                        "config": config,
+                        "epoch": epoch,
+                        "best_inst_acc": best_inst_acc,
+                        "best_class_acc": best_class_acc,
+                    },
+                    os.path.join(output_dir, "best.pth"),
+                )
+                print(f"  -> New best model saved! (inst_acc: {best_inst_acc:.4f})")
 
-    return best_inst_acc, best_class_acc
+            last_completed_epoch = epoch
+            _save_training_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_inst_acc=best_inst_acc,
+                best_class_acc=best_class_acc,
+                best_epoch=best_epoch,
+                history=history,
+                config=config,
+                seed=seed,
+                elapsed_time_total=elapsed_time_prior + time.time() - start_time,
+            )
+
+        elapsed = elapsed_time_prior + time.time() - start_time
+        print(f"\nTraining complete in {elapsed / 60:.1f} minutes.")
+        print(
+            f"Best: Epoch {best_epoch}, Inst Acc: {best_inst_acc:.4f}, "
+            f"Class Acc: {best_class_acc:.4f}"
+        )
+
+        log_file.write(
+            f"\nBest: Epoch {best_epoch}, Inst Acc: {best_inst_acc:.4f}, "
+            f"Class Acc: {best_class_acc:.4f}\n"
+        )
+        log_file.flush()
+
+        # Save last checkpoint
+        torch.save(
+            {
+                "model_state_dict": _unwrap_model(model).state_dict(),
+                "config": config,
+                "epoch": last_completed_epoch,
+                "best_inst_acc": best_inst_acc,
+                "best_class_acc": best_class_acc,
+            },
+            os.path.join(output_dir, "last.pth"),
+        )
+
+        # Plot training curves
+        _plot_curves(history, output_dir)
+
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+
+        return best_inst_acc, best_class_acc
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Resume by rerunning the same command.")
+        log_file.write("\nTraining interrupted. Resume by rerunning the same command.\n")
+        log_file.flush()
+        raise
+    finally:
+        log_file.close()
+        _shutdown_dataloader_workers(train_loader)
+        _shutdown_dataloader_workers(test_loader)
 
 
 def _seed_worker(worker_id: int):
@@ -397,3 +469,68 @@ def _plot_curves(history: dict, output_dir: str):
     plt.savefig(os.path.join(output_dir, "training_curves.png"), dpi=100)
     plt.close()
     print(f"Training curves saved to {output_dir}/training_curves.png")
+
+
+def _initial_history() -> dict:
+    return {
+        "train_loss": [],
+        "train_acc": [],
+        "train_inst_acc": [],
+        "train_class_acc": [],
+        "test_inst_acc": [],
+        "test_class_acc": [],
+    }
+
+
+def _normalize_history(raw: dict) -> dict:
+    h = _initial_history()
+    for key in h:
+        if key in raw and isinstance(raw[key], list):
+            h[key] = [float(v) for v in raw[key]]
+    return h
+
+
+def _infer_best_epoch(history: dict, fallback: int) -> int:
+    if not history.get("test_inst_acc"):
+        return fallback
+    return int(history["test_inst_acc"].index(max(history["test_inst_acc"]))) + 1
+
+
+def _move_optimizer_state(optimizer, device):
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+
+
+def _load_training_checkpoint(path: str) -> dict:
+    print(f"Found training checkpoint: {path}")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _save_training_checkpoint(
+    checkpoint_path, model, optimizer, scheduler, epoch,
+    best_inst_acc, best_class_acc, best_epoch, history,
+    config, seed, elapsed_time_total,
+):
+    torch.save(
+        {
+            "model_state_dict": _unwrap_model(model).state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_inst_acc": best_inst_acc,
+            "best_class_acc": best_class_acc,
+            "best_epoch": best_epoch,
+            "history": history,
+            "config": config,
+            "seed": seed,
+            "elapsed_time_total": elapsed_time_total,
+        },
+        checkpoint_path,
+    )
+
+
+def _shutdown_dataloader_workers(loader):
+    if hasattr(loader, "_iterator") and loader._iterator is not None:
+        loader._iterator._shutdown_workers()
