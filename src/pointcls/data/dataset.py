@@ -261,8 +261,13 @@ class ModelNet40Dataset(Dataset):
         Returns list of (points, label) tuples with points as (N, 6) tensors.
         """
         from tqdm.auto import tqdm
+        
+        # Use GPU for FPS if available (much faster than CPU)
+        gpu = torch.device("cuda") if torch.cuda.is_available() else None
+        
         cached = []
-        print(f"Preloading {len(self.filepaths)} {self.split} samples into memory...")
+        print(f"Preloading {len(self.filepaths)} {self.split} samples into memory..."
+              + (f" (GPU-accelerated)" if gpu else ""))
         for fp, lbl in tqdm(zip(self.filepaths, self.labels), total=len(self.filepaths),
                              desc=f"Preloading {self.split}"):
             vertices = read_pointcloud(fp)
@@ -275,8 +280,13 @@ class ModelNet40Dataset(Dataset):
             elif pts.shape[1] > 6:
                 pts = pts[:, :6]
 
-            # FPS
-            if pts.shape[0] >= self.num_points:
+            # FPS on GPU if available, fall back to CPU
+            if gpu:
+                pts_gpu = pts.to(gpu)
+                pts_b = pts_gpu.unsqueeze(0)
+                idx = farthest_point_sample(pts_b[:, :, :3], self.num_points).squeeze(0)
+                pts = pts_gpu[idx].cpu()
+            elif pts.shape[0] >= self.num_points:
                 pts_b = pts.unsqueeze(0)
                 idx = farthest_point_sample(pts_b[:, :, :3], self.num_points).squeeze(0)
                 pts = pts[idx]
