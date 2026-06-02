@@ -171,6 +171,7 @@ class ModelNet40Dataset(Dataset):
         num_points: int = 1024,
         use_normals: bool = False,
         augment: bool = False,
+        preload: bool = True,
     ):
         """
         Args:
@@ -179,6 +180,7 @@ class ModelNet40Dataset(Dataset):
             num_points: Number of points to sample via FPS.
             use_normals: Whether to include normal vectors (6 dims) or just xyz (3 dims).
             augment: Whether to apply data augmentation.
+            preload: If True, pre-FPS all data into memory at init (recommended).
         """
         super().__init__()
         if split not in ("train", "test"):
@@ -240,6 +242,10 @@ class ModelNet40Dataset(Dataset):
                 f"using {self.layout} layout. Check the dataset extraction."
             )
 
+        self._preloaded = None
+        if preload:
+            self._preloaded = self._preload_all()
+
     def _has_explicit_split(self) -> bool:
         return any(
             os.path.isdir(os.path.join(self.root, cls_name, "train"))
@@ -247,51 +253,86 @@ class ModelNet40Dataset(Dataset):
             for cls_name in self.classes
         )
 
+    def _preload_all(self) -> list:
+        """Pre-FPS and pre-normalize all samples into memory.
+        
+        This eliminates per-__getitem__ FPS overhead. Augmentation is still
+        applied on-the-fly since it must differ each epoch.
+        Returns list of (points, label) tuples with points as (N, 6) tensors.
+        """
+        from tqdm.auto import tqdm
+        cached = []
+        print(f"Preloading {len(self.filepaths)} {self.split} samples into memory...")
+        for fp, lbl in tqdm(zip(self.filepaths, self.labels), total=len(self.filepaths),
+                             desc=f"Preloading {self.split}"):
+            vertices = read_pointcloud(fp)
+            pts = torch.from_numpy(vertices.astype(np.float32, copy=False))
+            if pts.ndim != 2 or pts.shape[1] < 3:
+                raise ValueError(f"Bad shape: {pts.shape} in {fp}")
+            if pts.shape[1] < 6:
+                pad = torch.zeros(pts.shape[0], 6 - pts.shape[1], dtype=pts.dtype)
+                pts = torch.cat([pts, pad], dim=1)
+            elif pts.shape[1] > 6:
+                pts = pts[:, :6]
+
+            # FPS
+            if pts.shape[0] >= self.num_points:
+                pts_b = pts.unsqueeze(0)
+                idx = farthest_point_sample(pts_b[:, :, :3], self.num_points).squeeze(0)
+                pts = pts[idx]
+            else:
+                repeat = self.num_points // pts.shape[0] + 1
+                pts = pts.repeat(repeat, 1)[:self.num_points]
+
+            # Normalize xyz only
+            pts[:, :3] = normalize_pointcloud(pts[:, :3])
+            cached.append((pts, lbl))
+        return cached
+
     def __len__(self) -> int:
         return len(self.filepaths)
 
     def __getitem__(self, idx: int):
-        filepath = self.filepaths[idx]
         label = self.labels[idx]
 
-        # Read points and keep a stable internal shape: xyz plus optional normals.
-        vertices = read_pointcloud(filepath)
-        points = torch.from_numpy(vertices.astype(np.float32, copy=False))
-        if points.ndim != 2 or points.shape[1] < 3:
-            raise ValueError(f"Expected point cloud with shape (N, >=3), got {points.shape}")
-        if points.shape[0] == 0:
-            raise ValueError(f"Empty point cloud: {filepath}")
-        if points.shape[1] < 6:
-            pad = torch.zeros(points.shape[0], 6 - points.shape[1], dtype=points.dtype)
-            points = torch.cat([points, pad], dim=1)
-        elif points.shape[1] > 6:
-            points = points[:, :6]
-
-        # FPS sampling
-        if points.shape[0] >= self.num_points:
-            points_batch = points.unsqueeze(0)  # (1, N, 6)
-            xyz = points_batch[:, :, :3]  # (1, N, 3)
-            fps_idx = farthest_point_sample(xyz, self.num_points)  # (1, npoints)
-            fps_idx = fps_idx.squeeze(0)  # (npoints,)
-            points = points[fps_idx]  # (npoints, 6)
+        if self._preloaded is not None:
+            points, _ = self._preloaded[idx]
+            points = points.clone()  # clone so augmentation doesn't mutate cache
         else:
-            # If not enough points, pad by repeating
-            repeat = self.num_points // points.shape[0] + 1
-            points = points.repeat(repeat, 1)[:self.num_points]
+            filepath = self.filepaths[idx]
+            vertices = read_pointcloud(filepath)
+            points = torch.from_numpy(vertices.astype(np.float32, copy=False))
+            if points.ndim != 2 or points.shape[1] < 3:
+                raise ValueError(f"Expected point cloud with shape (N, >=3), got {points.shape}")
+            if points.shape[0] == 0:
+                raise ValueError(f"Empty point cloud: {filepath}")
+            if points.shape[1] < 6:
+                pad = torch.zeros(points.shape[0], 6 - points.shape[1], dtype=points.dtype)
+                points = torch.cat([points, pad], dim=1)
+            elif points.shape[1] > 6:
+                points = points[:, :6]
+            # FPS sampling
+            if points.shape[0] >= self.num_points:
+                points_batch = points.unsqueeze(0)
+                xyz = points_batch[:, :, :3]
+                fps_idx = farthest_point_sample(xyz, self.num_points).squeeze(0)
+                points = points[fps_idx]
+            else:
+                repeat = self.num_points // points.shape[0] + 1
+                points = points.repeat(repeat, 1)[:self.num_points]
+            # Normalize xyz
+            points[:, :3] = normalize_pointcloud(points[:, :3])
 
-        # Normalize xyz
-        points[:, :3] = normalize_pointcloud(points[:, :3])
-
-        # Augmentation (on xyz only)
+        # Augmentation (on xyz only) — applied fresh each epoch
         if self.augment_flag:
             from pointcls.data.augment import augment_pointcloud
             points = augment_pointcloud(points)
 
         # Select features
         if self.use_normals:
-            out = points  # (npoints, 6)
+            out = points
         else:
-            out = points[:, :3]  # (npoints, 3)
+            out = points[:, :3]
 
         return out, label
 

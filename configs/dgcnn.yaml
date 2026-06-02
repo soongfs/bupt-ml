@@ -3,7 +3,7 @@ num_points: 1024
 use_normals: false
 k: 20
 dropout: 0.5
-batch_size: 32
+batch_size: 256
 epochs: 250
 optimizer: Adam
 lr: 0.001
@@ -11,5 +11,6 @@ weight_decay: 0.0001
 scheduler: CosineAnnealingLR
 scheduler_T_max: 250
 label_smoothing: 0.2
-num_workers: 4
+num_workers: 8
+prefetch_factor: 4
 seed: 42

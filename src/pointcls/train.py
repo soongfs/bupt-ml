@@ -145,6 +145,7 @@ def train_model(config_path: str, overrides: dict | None = None):
 
     num_workers = config.get("num_workers", 4)
     pin_memory = device.type == "cuda"
+    prefetch = config.get("prefetch_factor", 2) if num_workers > 0 else None
     generator = torch.Generator()
     generator.manual_seed(seed)
 
@@ -154,6 +155,7 @@ def train_model(config_path: str, overrides: dict | None = None):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch,
         drop_last=True,
         worker_init_fn=_seed_worker,
         generator=generator,
@@ -165,6 +167,7 @@ def train_model(config_path: str, overrides: dict | None = None):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        prefetch_factor=prefetch,
         worker_init_fn=_seed_worker,
         persistent_workers=num_workers > 0,
     )
