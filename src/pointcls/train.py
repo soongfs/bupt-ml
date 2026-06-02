@@ -122,7 +122,6 @@ def train_model(config_path: str, overrides: dict | None = None):
     # Device
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        _print_cuda_info()
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
     else:
