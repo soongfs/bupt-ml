@@ -10,7 +10,7 @@ weight_decay: 0.0001
 scheduler: CosineAnnealingLR
 scheduler_T_max: 300
 label_smoothing: 0.2
-num_workers: 8
-prefetch_factor: 4
+num_workers: 0
+prefetch_factor: 2
 seed: 42
 elite: true
