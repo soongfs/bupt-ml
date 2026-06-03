@@ -68,11 +68,17 @@ def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
         print("Try the Pointcept fallback or Baidu Pan.")
         sys.exit(1)
 
-    # Flatten: the repo has a top-level "ModelNet40/" directory
+    # Flatten: the repo has a top-level "ModelNet40/" directory.
+    # Only move class subdirectories (those containing train/ and test/).
     nested = os.path.join(data_dir, "ModelNet40")
     if os.path.isdir(nested):
         for item in os.listdir(nested):
             src = os.path.join(nested, item)
+            if not os.path.isdir(src):
+                continue
+            if not (os.path.isdir(os.path.join(src, "train")) and
+                    os.path.isdir(os.path.join(src, "test"))):
+                continue  # Skip metadata dirs like "data/"
             dst = os.path.join(data_dir, item)
             if os.path.exists(dst):
                 if os.path.isdir(dst):
