@@ -199,7 +199,7 @@ class ModelNet40Dataset(Dataset):
         # Get sorted class names
         self.classes = sorted(
             d for d in os.listdir(root)
-            if os.path.isdir(os.path.join(root, d))
+            if os.path.isdir(os.path.join(root, d)) and d.lower() not in {"modelnet40", "__macosx"}
             and not d.startswith("_")
             and not d.startswith(".")
             and d != "__MACOSX"
