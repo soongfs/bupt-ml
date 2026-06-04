@@ -84,7 +84,7 @@ def run_test(
     # Load test data
     use_normals = config.get("use_normals", False)
     num_points = config.get("num_points", 1024)
-    test_samples, sample_ids = _load_test_data(
+    test_samples, sample_ids, labels = _load_test_data(
         test_dir,
         device,
         num_points=num_points,
@@ -145,6 +145,23 @@ def run_test(
     elapsed = time.time() - start_time
     print(f"Inference complete: {len(test_samples)} samples in {elapsed:.1f}s")
 
+    # Compute accuracy if labels are available
+    if labels is not None:
+        correct = sum(1 for pred, label in zip(predictions, labels) if pred == label)
+        inst_acc = correct / len(labels)
+        # Per-class accuracy
+        from collections import defaultdict
+        class_correct = defaultdict(int)
+        class_total = defaultdict(int)
+        for pred, label in zip(predictions, labels):
+            class_total[label] += 1
+            if pred == label:
+                class_correct[label] += 1
+        per_class = [class_correct[c] / class_total[c] for c in sorted(class_total)]
+        class_acc = sum(per_class) / len(per_class)
+        print(f"Inst Acc: {correct}/{len(labels)} = {inst_acc:.4f}")
+        print(f"Class Acc: {class_acc:.4f}")
+
     # Write CSV
     with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -167,9 +184,11 @@ def _load_test_data(
     Returns:
         test_samples: list of (N, C) tensors on device.
         sample_ids: list of sample identifiers.
+        labels: list of int labels, or None if unavailable.
     """
     test_samples = []
     sample_ids = []
+    labels = None
 
     if _has_modelnet_test_split(test_dir):
         from pointcls.data.dataset import ModelNet40Dataset
@@ -182,11 +201,13 @@ def _load_test_data(
             pass
         else:
             print(f"Found {len(dataset)} ModelNet40 test files (split layout)")
+            labels = []
             for i in range(len(dataset)):
-                points, _ = dataset[i]
+                points, label = dataset[i]
                 test_samples.append(points.to(device))
                 sample_ids.append(os.path.splitext(os.path.basename(dataset.filepaths[i]))[0])
-            return test_samples, sample_ids
+                labels.append(label)
+            return test_samples, sample_ids, labels
 
     # Try unsplit layout (train/test split programmatically)
     try:
@@ -196,11 +217,13 @@ def _load_test_data(
             num_points=num_points, use_normals=use_normals, augment=False,
         )
         print(f"Found {len(dataset)} ModelNet40 test files (unsplit layout)")
+        labels = []
         for i in range(len(dataset)):
-            points, _ = dataset[i]
+            points, label = dataset[i]
             test_samples.append(points.to(device))
             sample_ids.append(os.path.splitext(os.path.basename(dataset.filepaths[i]))[0])
-        return test_samples, sample_ids
+            labels.append(label)
+        return test_samples, sample_ids, labels
     except Exception:
         pass
 
@@ -217,7 +240,7 @@ def _load_test_data(
             points = _prepare_points(data, device, num_points, use_normals)
             test_samples.append(points)
             sample_ids.append(fname.replace(".npy", ""))
-        return test_samples, sample_ids
+        return test_samples, sample_ids, None
 
     # Check for .off/.txt files
     point_files = []
@@ -234,7 +257,7 @@ def _load_test_data(
             points = _prepare_points(vertices, device, num_points, use_normals)
             test_samples.append(points)
             sample_ids.append(os.path.splitext(os.path.basename(fpath))[0])
-        return test_samples, sample_ids
+        return test_samples, sample_ids, None
 
     raise FileNotFoundError(f"No .off, .txt, or .npy files found in {test_dir}")
 
