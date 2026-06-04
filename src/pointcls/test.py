@@ -173,25 +173,36 @@ def _load_test_data(
 
     if _has_modelnet_test_split(test_dir):
         from pointcls.data.dataset import ModelNet40Dataset
-
         try:
             dataset = ModelNet40Dataset(
-                root=test_dir,
-                split="test",
-                num_points=num_points,
-                use_normals=use_normals,
-                augment=False,
-                preload=False,
+                root=test_dir, split="test",
+                num_points=num_points, use_normals=use_normals, augment=False,
             )
-        except RuntimeError as exc:
-            print(f"Could not load ModelNet40 test split: {exc}")
+        except RuntimeError:
+            pass
         else:
-            print(f"Found {len(dataset)} ModelNet40 test files")
+            print(f"Found {len(dataset)} ModelNet40 test files (split layout)")
             for i in range(len(dataset)):
                 points, _ = dataset[i]
                 test_samples.append(points.to(device))
                 sample_ids.append(os.path.splitext(os.path.basename(dataset.filepaths[i]))[0])
             return test_samples, sample_ids
+
+    # Try unsplit layout (train/test split programmatically)
+    try:
+        from pointcls.data.dataset import ModelNet40Dataset
+        dataset = ModelNet40Dataset(
+            root=test_dir, split="test",
+            num_points=num_points, use_normals=use_normals, augment=False,
+        )
+        print(f"Found {len(dataset)} ModelNet40 test files (unsplit layout)")
+        for i in range(len(dataset)):
+            points, _ = dataset[i]
+            test_samples.append(points.to(device))
+            sample_ids.append(os.path.splitext(os.path.basename(dataset.filepaths[i]))[0])
+        return test_samples, sample_ids
+    except Exception:
+        pass
 
     # Check for .npy files
     npy_files = sorted([
