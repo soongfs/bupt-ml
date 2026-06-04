@@ -1,6 +1,6 @@
 model: dgcnn
 num_points: 1024
-use_normals: false
+use_normals: true
 k: 20
 dropout: 0.5
 batch_size: 128

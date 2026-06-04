@@ -4,6 +4,16 @@ import torch
 import numpy as np
 
 
+def _random_so3_matrix(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    from scipy.spatial.transform import Rotation
+
+    return torch.as_tensor(
+        Rotation.random().as_matrix().astype(np.float32),
+        device=device,
+        dtype=dtype,
+    )
+
+
 def random_rotation_so3(points: torch.Tensor) -> torch.Tensor:
     """Apply a random SO(3) rotation to a point cloud.
 
@@ -13,8 +23,6 @@ def random_rotation_so3(points: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated points, same shape as input.
     """
-    from scipy.spatial.transform import Rotation
-
     original_shape = points.shape
     if points.dim() == 2:
         points = points.unsqueeze(0)  # (1, N, 3)
@@ -25,9 +33,7 @@ def random_rotation_so3(points: torch.Tensor) -> torch.Tensor:
     B = points.shape[0]
     rotated = []
     for b in range(B):
-        R = torch.from_numpy(
-            Rotation.random().as_matrix().astype(np.float32)
-        )
+        R = _random_so3_matrix(points.device, points.dtype)
         # Apply rotation: (N, 3) @ (3, 3) -> (N, 3)
         rotated.append(points[b] @ R.T)
 
@@ -71,10 +77,10 @@ def random_jitter(points: torch.Tensor, std: float = 0.01) -> torch.Tensor:
 def augment_pointcloud(points: torch.Tensor) -> torch.Tensor:
     """Apply augmentation pipeline: rotation -> scaling -> jitter.
 
-    Only operates on xyz coordinates (first 3 dims).
+    Rotates xyz and normals together; scale/jitter only affect xyz.
 
     Args:
-        points: Tensor of shape (N, 3) or (N, 6) — only first 3 dims are augmented.
+        points: Tensor of shape (N, 3) or (N, 6+).
 
     Returns:
         Augmented points, same shape as input.
@@ -82,15 +88,20 @@ def augment_pointcloud(points: torch.Tensor) -> torch.Tensor:
     if points.dim() != 2 or points.shape[1] < 3:
         raise ValueError(f"Expected (N, >=3) tensor, got {points.shape}")
 
-    xyz = points[:, :3]
-    normals = points[:, 3:] if points.shape[1] > 3 else None
+    R = _random_so3_matrix(points.device, points.dtype)
 
-    xyz = random_rotation_so3(xyz)
+    xyz = points[:, :3] @ R.T
     xyz = random_scale(xyz)
     xyz = random_jitter(xyz)
 
-    if normals is not None:
-        points = torch.cat([xyz, normals], dim=1)
+    if points.shape[1] >= 6:
+        normals = points[:, 3:6] @ R.T
+        features = [xyz, normals]
+        if points.shape[1] > 6:
+            features.append(points[:, 6:])
+        points = torch.cat(features, dim=1)
+    elif points.shape[1] > 3:
+        points = torch.cat([xyz, points[:, 3:]], dim=1)
     else:
         points = xyz
 
