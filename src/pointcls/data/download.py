@@ -19,8 +19,9 @@ def verify_modelnet40(data_dir: str) -> bool:
         return False
     subdirs = [d for d in os.listdir(data_dir)
                if os.path.isdir(os.path.join(data_dir, d))
-               and not d.startswith("_") and not d.startswith(".")]
-    if len(subdirs) != 40:
+               and not d.startswith("_") and not d.startswith(".")
+               and d not in ("ModelNet40", "modelnet40", "__MACOSX")]
+    if len(subdirs) < 40:
         return False
 
     # Split layout: class/train/ + class/test/
