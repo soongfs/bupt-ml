@@ -9,7 +9,12 @@ HF_REPO = "naderalfares/ModelNet40"
 
 
 def verify_modelnet40(data_dir: str) -> bool:
-    """Check that 40 class dirs exist, each with train/ and test/ subdirs."""
+    """Check that 40 class dirs exist with valid data files.
+
+    Accepts two layouts:
+    - Split: each class dir has train/ and test/ subdirectories.
+    - Unsplit: each class dir contains .txt or .off files directly.
+    """
     if not os.path.isdir(data_dir):
         return False
     subdirs = [d for d in os.listdir(data_dir)
@@ -17,11 +22,26 @@ def verify_modelnet40(data_dir: str) -> bool:
                and not d.startswith("_") and not d.startswith(".")]
     if len(subdirs) != 40:
         return False
-    return all(
+
+    # Split layout: class/train/ + class/test/
+    split_ok = all(
         os.path.isdir(os.path.join(data_dir, d, "train")) and
         os.path.isdir(os.path.join(data_dir, d, "test"))
         for d in subdirs
     )
+    if split_ok:
+        return True
+
+    # Unsplit layout: class/*.txt or class/*.off
+    unsplit_ok = all(
+        any(
+            f.endswith((".txt", ".off"))
+            for f in os.listdir(os.path.join(data_dir, d))
+            if os.path.isfile(os.path.join(data_dir, d, f))
+        )
+        for d in subdirs
+    )
+    return unsplit_ok
 
 
 def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
