@@ -1,5 +1,6 @@
 """Unified CLI for point cloud classification."""
 
+import os
 import click
 
 
@@ -94,11 +95,12 @@ def train_all(data_dir: str):
     from pointcls.train import train_model
 
     print("=" * 60)
-    print(" Pipeline: Download + Train DGCNN + Train PointMLP")
+    print(" Pipeline: Train DGCNN + Train PointMLP")
     print("=" * 60)
 
-    # Download
-    download_modelnet40(data_dir)
+    # Only download if data directory doesn't exist
+    if not os.path.isdir(data_dir) or not os.listdir(data_dir):
+        download_modelnet40(data_dir)
 
     # Train DGCNN
     dgcnn_config = "configs/dgcnn.yaml"
