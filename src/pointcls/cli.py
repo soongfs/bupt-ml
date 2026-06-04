@@ -1,6 +1,5 @@
 """Unified CLI for point cloud classification."""
 
-import os
 import click
 
 
@@ -91,15 +90,14 @@ def test(checkpoint: str, test_dir: str, output: str, num_votes: int, batch_size
 )
 def train_all(data_dir: str):
     """Download data and train both DGCNN and PointMLP."""
-    from pointcls.data.download import download_modelnet40
+    from pointcls.data.download import download_modelnet40, verify_modelnet40
     from pointcls.train import train_model
 
     print("=" * 60)
     print(" Pipeline: Train DGCNN + Train PointMLP")
     print("=" * 60)
 
-    # Only download if data directory doesn't exist
-    if not os.path.isdir(data_dir) or not os.listdir(data_dir):
+    if not verify_modelnet40(data_dir):
         download_modelnet40(data_dir)
 
     # Train DGCNN
