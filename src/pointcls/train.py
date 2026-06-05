@@ -146,6 +146,7 @@ def train_model(config_path: str, overrides: dict | None = None):
         num_points=config.get("num_points", 1024),
         use_normals=config.get("use_normals", False),
         augment=True,
+        rotation_mode=config.get("rotation_mode", config.get("rotation_aug", "z")),
     )
     test_dataset = ModelNet40Dataset(
         root=data_dir,

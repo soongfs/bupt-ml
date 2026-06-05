@@ -28,18 +28,27 @@ def knn(x: torch.Tensor, k: int) -> torch.Tensor:
     return idx
 
 
-def get_graph_feature(x: torch.Tensor, k: int = 20) -> torch.Tensor:
+def get_graph_feature(
+    x: torch.Tensor,
+    k: int = 20,
+    coord_dims: int | None = None,
+) -> torch.Tensor:
     """Build edge features from k-nearest neighbors.
 
     Args:
         x: Tensor of shape (B, C, N).
         k: Number of neighbors.
+        coord_dims: If set, build the kNN graph using only the first
+            coord_dims channels, while gathering edge features from all C
+            channels. This is useful for point clouds with normals: xyz should
+            define geometry, normals should be attributes.
 
     Returns:
         Tensor of shape (B, 2*C, N, k) with [central, neighbor-central] features.
     """
     B, C, N = x.shape
-    idx = knn(x, k)  # (B, N, k)
+    graph_x = x[:, :coord_dims, :] if coord_dims is not None else x
+    idx = knn(graph_x, k)  # (B, N, k)
 
     # Gather neighbor features
     # Expand idx to (B, C, N, k) by repeating across channel dim
@@ -66,9 +75,17 @@ def get_graph_feature(x: torch.Tensor, k: int = 20) -> torch.Tensor:
 class EdgeConv(nn.Module):
     """EdgeConv block: kNN graph -> MLP -> max pool over neighbors."""
 
-    def __init__(self, in_channels: int, mid_channels: int, out_channels: int, k: int = 20):
+    def __init__(
+        self,
+        in_channels: int,
+        mid_channels: int,
+        out_channels: int,
+        k: int = 20,
+        graph_coord_dims: int | None = None,
+    ):
         super().__init__()
         self.k = k
+        self.graph_coord_dims = graph_coord_dims
         self.conv1 = nn.Sequential(
             nn.Conv2d(in_channels * 2, mid_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(mid_channels),
@@ -88,7 +105,7 @@ class EdgeConv(nn.Module):
         Returns:
             (B, C_out, N)
         """
-        edge_feat = get_graph_feature(x, self.k)  # (B, 2*C_in, N, k)
+        edge_feat = get_graph_feature(x, self.k, coord_dims=self.graph_coord_dims)  # (B, 2*C_in, N, k)
         edge_feat = self.conv1(edge_feat)  # (B, mid, N, k)
         edge_feat = self.conv2(edge_feat)  # (B, C_out, N, k)
         # Max pool over neighbor dimension
@@ -108,10 +125,13 @@ class DGCNN(nn.Module):
         input_dim: int = 3,
     ):
         super().__init__()
-        self.k = k
+        self.input_dim = input_dim
 
-        # Four EdgeConv layers
-        self.edge_conv1 = EdgeConv(input_dim, 64, 64, k=k)
+        # Four EdgeConv layers. When normals are present, the first dynamic
+        # graph is still built from xyz only; normals are gathered as per-point
+        # attributes in the edge features.
+        first_graph_coord_dims = min(3, input_dim)
+        self.edge_conv1 = EdgeConv(input_dim, 64, 64, k=k, graph_coord_dims=first_graph_coord_dims)
         self.edge_conv2 = EdgeConv(64, 64, 64, k=k)
         self.edge_conv3 = EdgeConv(64, 128, 128, k=k)
         self.edge_conv4 = EdgeConv(128, 256, 256, k=k)
@@ -141,19 +161,24 @@ class DGCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, 3, N) or (B, N, 3)
+            x: (B, C, N) or (B, N, C), where C is input_dim (3 xyz or 6 xyz+normals)
 
         Returns:
             logits: (B, num_classes)
         """
-        # Detect and transpose if input is (B, N, 3)
-        if x.shape[1] != 3 and x.shape[2] == 3:
-            x = x.transpose(2, 1)  # (B, 3, N)
-        elif x.shape[1] == 3:
-            pass  # Already (B, 3, N)
+        if x.ndim != 3:
+            raise ValueError(f"Expected a 3D tensor (B,C,N) or (B,N,C), got shape {tuple(x.shape)}")
+
+        # Accept both common point cloud layouts. Prefer an explicit match
+        # against the configured channel count so (B, N, 6) is handled correctly.
+        if x.shape[1] == self.input_dim:
+            pass  # Already (B, C, N)
+        elif x.shape[2] == self.input_dim:
+            x = x.transpose(2, 1).contiguous()  # (B, C, N)
         else:
-            # Assume 3 is the channel dim for other input dims
-            pass
+            raise ValueError(
+                f"Expected channel dimension {self.input_dim} in axis 1 or 2, got shape {tuple(x.shape)}"
+            )
 
         x1 = self.edge_conv1(x)
         x2 = self.edge_conv2(x1)

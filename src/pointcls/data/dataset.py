@@ -171,6 +171,7 @@ class ModelNet40Dataset(Dataset):
         num_points: int = 1024,
         use_normals: bool = False,
         augment: bool = False,
+        rotation_mode: str = "z",
         preload: bool = True,
     ):
         """
@@ -180,6 +181,7 @@ class ModelNet40Dataset(Dataset):
             num_points: Number of points to sample via FPS.
             use_normals: Whether to include normal vectors (6 dims) or just xyz (3 dims).
             augment: Whether to apply data augmentation.
+            rotation_mode: Training rotation augmentation mode: none, z, or so3.
             preload: If True, pre-FPS all data into memory at init (recommended).
         """
         super().__init__()
@@ -195,6 +197,7 @@ class ModelNet40Dataset(Dataset):
         self.num_points = num_points
         self.use_normals = use_normals
         self.augment_flag = augment
+        self.rotation_mode = rotation_mode
 
         # Get sorted class names
         self.classes = sorted(
@@ -346,7 +349,7 @@ class ModelNet40Dataset(Dataset):
         # Augmentation (on xyz only) — applied fresh each epoch
         if self.augment_flag:
             from pointcls.data.augment import augment_pointcloud
-            points = augment_pointcloud(points)
+            points = augment_pointcloud(points, rotation_mode=self.rotation_mode)
 
         # Select features
         if self.use_normals:

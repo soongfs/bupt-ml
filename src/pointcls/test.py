@@ -16,6 +16,7 @@ def run_test(
     output_path: str,
     num_votes: int = 10,
     batch_size: int = 32,
+    rotation_mode: str = "none",
 ):
     """Run inference on test data with multi-view voting.
 
@@ -25,9 +26,13 @@ def run_test(
             - If it contains .off/.txt files in subdirectories, use dataset loader.
             - If it contains .npy files, load them directly.
         output_path: Path to output CSV file.
-        num_votes: Number of random rotations for voting.
+        num_votes: Number of votes to average.
         batch_size: Batch size for inference.
+        rotation_mode: Test-time voting rotation mode: none, z, or so3.
     """
+    from pointcls.data.augment import _validate_rotation_mode
+    rotation_mode = _validate_rotation_mode(rotation_mode)
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -99,7 +104,7 @@ def run_test(
     class_names = _get_class_names(test_dir)
 
     # Inference with voting
-    print(f"Running inference with {num_votes} votes...")
+    print(f"Running inference with {num_votes} vote(s), rotation_mode={rotation_mode}...")
     predictions = []
     start_time = time.time()
 
@@ -109,7 +114,7 @@ def run_test(
 
         for v in range(num_votes):
             # Create rotated copy with different seed
-            rotated = _random_rotate(points, seed=i * 1000 + v)
+            rotated = _random_rotate(points, seed=i * 1000 + v, rotation_mode=rotation_mode)
 
             # Normalize
             rotated = rotated.clone()
@@ -358,25 +363,36 @@ def _get_class_names(test_dir: str):
     return default
 
 
-def _random_rotate(points: torch.Tensor, seed: int) -> torch.Tensor:
-    """Apply random SO(3) rotation with fixed seed.
+def _random_rotate(points: torch.Tensor, seed: int, rotation_mode: str = "none") -> torch.Tensor:
+    """Apply a deterministic test-time rotation.
 
     Args:
-        points: (N, 3) tensor.
+        points: (N, C) tensor where first three channels are xyz and optional
+            channels 3:6 are normals.
         seed: Random seed for reproducibility.
+        rotation_mode: none, z, or so3.
 
     Returns:
-        Rotated points (N, 3).
+        Rotated points with the same shape as input.
     """
     from scipy.spatial.transform import Rotation
+    from pointcls.data.augment import _z_rotation_matrix, _validate_rotation_mode
+
+    rotation_mode = _validate_rotation_mode(rotation_mode)
+    rotated = points.clone()
+    if rotation_mode == "none":
+        return rotated
 
     # Use a local random state with the given seed
     rng = np.random.RandomState(seed)
-    R = torch.from_numpy(
-        Rotation.random(random_state=rng).as_matrix().astype(np.float32)
-    ).to(points.device)
+    if rotation_mode == "z":
+        angle = float(rng.uniform(0.0, 2.0 * np.pi))
+        R = _z_rotation_matrix(angle, points.device, points.dtype)
+    else:
+        R = torch.from_numpy(
+            Rotation.random(random_state=rng).as_matrix().astype(np.float32)
+        ).to(device=points.device, dtype=points.dtype)
 
-    rotated = points.clone()
     rotated[:, :3] = points[:, :3] @ R.T
     if points.shape[1] >= 6:
         rotated[:, 3:6] = points[:, 3:6] @ R.T

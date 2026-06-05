@@ -65,8 +65,15 @@ def train(config: str, batch_size: int | None, epochs: int | None):
 )
 @click.option(
     "--num-votes",
-    default=10,
-    help="Number of random rotations for voting.",
+    default=1,
+    help="Number of votes to average.",
+    show_default=True,
+)
+@click.option(
+    "--rotation-mode",
+    type=click.Choice(["none", "z", "so3"]),
+    default="none",
+    help="Test-time voting rotation mode.",
     show_default=True,
 )
 @click.option(
@@ -75,10 +82,17 @@ def train(config: str, batch_size: int | None, epochs: int | None):
     help="Batch size for inference.",
     show_default=True,
 )
-def test(checkpoint: str, test_dir: str, output: str, num_votes: int, batch_size: int):
-    """Run inference with multi-view voting and save predictions."""
+def test(
+    checkpoint: str,
+    test_dir: str,
+    output: str,
+    num_votes: int,
+    rotation_mode: str,
+    batch_size: int,
+):
+    """Run inference with optional voting and save predictions."""
     from pointcls.test import run_test
-    run_test(checkpoint, test_dir, output, num_votes, batch_size)
+    run_test(checkpoint, test_dir, output, num_votes, batch_size, rotation_mode=rotation_mode)
 
 
 @cli.command()
@@ -147,8 +161,15 @@ def train_all(data_dir: str):
 )
 @click.option(
     "--num-votes",
-    default=10,
+    default=1,
     help="Number of votes per model.",
+    show_default=True,
+)
+@click.option(
+    "--rotation-mode",
+    type=click.Choice(["none", "z", "so3"]),
+    default="none",
+    help="Test-time voting rotation mode.",
     show_default=True,
 )
 def test_both(
@@ -157,6 +178,7 @@ def test_both(
     test_dir: str,
     output_dir: str,
     num_votes: int,
+    rotation_mode: str,
 ):
     """Test both DGCNN and PointMLP on the same test data."""
     import os
@@ -170,6 +192,7 @@ def test_both(
         test_dir,
         os.path.join(output_dir, "dgcnn_result.csv"),
         num_votes=num_votes,
+        rotation_mode=rotation_mode,
     )
 
     print("\n>>> PointMLP Inference...")
@@ -178,6 +201,7 @@ def test_both(
         test_dir,
         os.path.join(output_dir, "pointmlp_result.csv"),
         num_votes=num_votes,
+        rotation_mode=rotation_mode,
     )
 
     print(f"\nResults saved in: {output_dir}/")

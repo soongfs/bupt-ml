@@ -1,6 +1,7 @@
 model: pointmlp
 num_points: 1024
 use_normals: false
+rotation_mode: z
 dropout: 0.5
 batch_size: 128
 epochs: 300
