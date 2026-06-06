@@ -7,7 +7,7 @@ import time
 import numpy as np
 import torch
 
-from pointcls.models import DGCNN, PointMLP
+from pointcls.models.factory import build_model, infer_model_name
 
 
 def run_test(
@@ -50,34 +50,9 @@ def run_test(
     print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}, best inst acc: {best_acc}")
 
     # Instantiate model
-    model_name = config.get("model", "")
-    if not model_name:
-        # Try to infer from checkpoint keys or path
-        if "dgcnn" in checkpoint_path.lower():
-            model_name = "dgcnn"
-        elif "pointmlp" in checkpoint_path.lower():
-            model_name = "pointmlp"
-        else:
-            raise ValueError("Cannot determine model type from checkpoint or path.")
-
+    model_name = infer_model_name(config, checkpoint_path)
     print(f"Model: {model_name}")
-
-    if model_name == "dgcnn":
-        model = DGCNN(
-            k=config.get("k", 20),
-            dropout=config.get("dropout", 0.5),
-            num_classes=40,
-            input_dim=6 if config.get("use_normals", False) else 3,
-        )
-    elif model_name == "pointmlp":
-        model = PointMLP(
-            num_classes=40,
-            use_normals=config.get("use_normals", False),
-            elite=config.get("elite", True),
-            dropout=config.get("dropout", 0.5),
-        )
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    model = build_model(config, checkpoint_path)
 
     state_dict = checkpoint["model_state_dict"]
     if state_dict and all(k.startswith("module.") for k in state_dict):
@@ -97,56 +72,20 @@ def run_test(
     )
     print(f"Test samples: {len(test_samples)}")
 
-    # Class names (alphabetically sorted, same as dataset)
-    from pointcls.data.dataset import normalize_pointcloud
-    # We know ModelNet40 has 40 classes, alphabetically sorted
-    # Extract class names from dataset structure if possible
     class_names = _get_class_names(test_dir)
 
     # Inference with voting
     print(f"Running inference with {num_votes} vote(s), rotation_mode={rotation_mode}...")
-    predictions = []
     start_time = time.time()
-
-    for i, points in enumerate(test_samples):
-        # points: (N, 3) on device
-        all_logits = []
-
-        for v in range(num_votes):
-            # Create rotated copy with different seed
-            rotated = _random_rotate(points, seed=i * 1000 + v, rotation_mode=rotation_mode)
-
-            # Normalize
-            rotated = rotated.clone()
-            rotated[:, :3] = normalize_pointcloud(rotated[:, :3])
-            if not use_normals:
-                rotated = rotated[:, :3]
-            elif rotated.shape[1] < 6:
-                pad = torch.zeros(
-                    rotated.shape[0],
-                    6 - rotated.shape[1],
-                    dtype=rotated.dtype,
-                    device=rotated.device,
-                )
-                rotated = torch.cat([rotated, pad], dim=1)
-
-            # Prepare batch (1, 3, N)
-            batch = rotated.unsqueeze(0).transpose(2, 1).contiguous()  # (1, C, N)
-
-            with torch.no_grad():
-                logits = model(batch)  # (1, 40)
-
-            all_logits.append(logits)
-
-        # Average logits across votes
-        avg_logits = torch.stack(all_logits, dim=0).mean(dim=0)  # (1, 40)
-        pred_class = avg_logits.argmax(dim=1).item()
-        predictions.append(pred_class)
-
-        if (i + 1) % 100 == 0:
-            elapsed = time.time() - start_time
-            print(f"  {i + 1}/{len(test_samples)} samples ({elapsed:.1f}s)")
-
+    logits = predict_logits_batched(
+        model,
+        test_samples,
+        use_normals=use_normals,
+        num_votes=num_votes,
+        rotation_mode=rotation_mode,
+        batch_size=batch_size,
+    )
+    predictions = logits.argmax(dim=1).tolist()
     elapsed = time.time() - start_time
     print(f"Inference complete: {len(test_samples)} samples in {elapsed:.1f}s")
 
@@ -176,6 +115,63 @@ def run_test(
             writer.writerow([sid, class_name])
 
     print(f"Results saved to: {output_path}")
+
+
+def predict_logits_batched(
+    model: torch.nn.Module,
+    test_samples: list[torch.Tensor],
+    use_normals: bool,
+    num_votes: int = 1,
+    rotation_mode: str = "none",
+    batch_size: int = 32,
+) -> torch.Tensor:
+    """Predict averaged logits for samples using batched voting inference."""
+    from pointcls.data.augment import _validate_rotation_mode
+    from pointcls.data.dataset import normalize_pointcloud
+
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    rotation_mode = _validate_rotation_mode(rotation_mode)
+    if len(test_samples) == 0:
+        return torch.empty(0, 0)
+
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = test_samples[0].device
+    logits_sum = None
+    model.eval()
+    sample_count = len(test_samples)
+    with torch.no_grad():
+        for start in range(0, sample_count, batch_size):
+            chunk = test_samples[start:start + batch_size]
+            vote_sum = None
+            for v in range(num_votes):
+                prepared = []
+                for offset, points in enumerate(chunk):
+                    sample_idx = start + offset
+                    rotated = _random_rotate(points, seed=sample_idx * 1000 + v, rotation_mode=rotation_mode)
+                    rotated = rotated.clone()
+                    rotated[:, :3] = normalize_pointcloud(rotated[:, :3])
+                    if not use_normals:
+                        rotated = rotated[:, :3]
+                    elif rotated.shape[1] < 6:
+                        pad = torch.zeros(
+                            rotated.shape[0],
+                            6 - rotated.shape[1],
+                            dtype=rotated.dtype,
+                            device=rotated.device,
+                        )
+                        rotated = torch.cat([rotated, pad], dim=1)
+                    prepared.append(rotated)
+                batch = torch.stack(prepared, dim=0).transpose(2, 1).contiguous().to(device)
+                logits = model(batch)
+                vote_sum = logits if vote_sum is None else vote_sum + logits
+            avg_logits = vote_sum / max(num_votes, 1)
+            logits_sum = avg_logits if logits_sum is None else torch.cat([logits_sum, avg_logits], dim=0)
+            if (start + len(chunk)) % 100 == 0 or start + len(chunk) == sample_count:
+                print(f"  {start + len(chunk)}/{sample_count} samples")
+    return logits_sum.cpu()
 
 
 def _load_test_data(

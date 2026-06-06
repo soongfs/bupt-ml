@@ -1,0 +1,22 @@
+model: pointnext
+num_points: 2048
+use_normals: true
+rotation_mode: z
+width: 64
+blocks: [1, 2, 2, 2]
+strides: [1, 2, 2, 2]
+nsample: [32, 32, 24, 24]
+expansion: 4
+dropout: 0.4
+batch_size: 48
+epochs: 300
+optimizer: AdamW
+lr: 0.001
+weight_decay: 0.05
+scheduler: CosineAnnealingLR
+scheduler_T_max: 300
+label_smoothing: 0.1
+num_workers: 0
+prefetch_factor: 2
+seed: 42
+gpu_reserve_mb: 5000

@@ -17,7 +17,7 @@ matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 
 from pointcls.data.dataset import ModelNet40Dataset
-from pointcls.models import DGCNN, PointMLP
+from pointcls.models.factory import build_model, infer_model_name
 
 
 def set_seed(seed: int):
@@ -196,23 +196,7 @@ def train_model(config_path: str, overrides: dict | None = None):
     )
 
     # Model
-    if model_name == "dgcnn":
-        model = DGCNN(
-            k=config.get("k", 20),
-            emb_dims=1024,
-            dropout=config.get("dropout", 0.5),
-            num_classes=40,
-            input_dim=3 if not config.get("use_normals", False) else 6,
-        )
-    elif model_name == "pointmlp":
-        model = PointMLP(
-            num_classes=40,
-            use_normals=config.get("use_normals", False),
-            elite=config.get("elite", True),
-            dropout=config.get("dropout", 0.5),
-        )
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    model = build_model(config)
 
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"Using DataParallel across {torch.cuda.device_count()} CUDA devices.")

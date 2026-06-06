@@ -207,5 +207,75 @@ def test_both(
     print(f"\nResults saved in: {output_dir}/")
 
 
+@cli.command()
+@click.option(
+    "--checkpoints",
+    required=True,
+    help="Comma-separated checkpoint paths.",
+)
+@click.option(
+    "--test-dir",
+    "-t",
+    required=True,
+    help="Directory containing test data.",
+)
+@click.option(
+    "--output",
+    "-o",
+    default="ensemble_result.csv",
+    help="Output CSV path.",
+    show_default=True,
+)
+@click.option(
+    "--weights",
+    default=None,
+    help="Comma-separated model weights. Defaults to equal weights.",
+)
+@click.option(
+    "--num-votes",
+    default=1,
+    help="Number of votes per model.",
+    show_default=True,
+)
+@click.option(
+    "--rotation-mode",
+    type=click.Choice(["none", "z", "so3"]),
+    default="none",
+    help="Test-time voting rotation mode.",
+    show_default=True,
+)
+@click.option(
+    "--batch-size",
+    default=32,
+    help="Batch size for inference.",
+    show_default=True,
+)
+def ensemble(
+    checkpoints: str,
+    test_dir: str,
+    output: str,
+    weights: str | None,
+    num_votes: int,
+    rotation_mode: str,
+    batch_size: int,
+):
+    """Run weighted logits ensemble over multiple checkpoints."""
+    from pointcls.ensemble import run_ensemble
+
+    checkpoint_paths = [p.strip() for p in checkpoints.split(",") if p.strip()]
+    parsed_weights = None
+    if weights:
+        parsed_weights = [float(w.strip()) for w in weights.split(",") if w.strip()]
+    run_ensemble(
+        checkpoint_paths,
+        test_dir,
+        output,
+        weights=parsed_weights,
+        num_votes=num_votes,
+        rotation_mode=rotation_mode,
+        batch_size=batch_size,
+    )
+
+
 if __name__ == "__main__":
     cli()
