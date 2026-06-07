@@ -1,4 +1,5 @@
 model: dgcnn
+output_dir: runs/dgcnn
 num_points: 1024
 use_normals: true
 rotation_mode: z

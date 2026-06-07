@@ -1,4 +1,5 @@
 model: pointmlp
+output_dir: runs/pointmlp
 num_points: 1024
 use_normals: false
 rotation_mode: z

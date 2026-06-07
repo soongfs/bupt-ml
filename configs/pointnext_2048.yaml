@@ -1,4 +1,5 @@
 model: pointnext
+output_dir: runs/pointnext_2048
 num_points: 2048
 use_normals: true
 rotation_mode: z

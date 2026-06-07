@@ -3,6 +3,7 @@
 import os
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -107,10 +108,11 @@ def train_model(config_path: str, overrides: dict | None = None):
         print(f"Config overrides applied: {overrides}")
 
     model_name = config["model"]
-    output_dir = os.path.join("runs", model_name)
+    output_dir = _resolve_output_dir(config)
     checkpoint_path = os.path.join(output_dir, "checkpoint.pth")
     resume_checkpoint = None
     if os.path.exists(checkpoint_path):
+        _check_resume_config_compatible(config, checkpoint_path)
         resume_checkpoint = _load_training_checkpoint(checkpoint_path)
 
     print(f"\n{'='*60}")
@@ -370,6 +372,7 @@ def train_model(config_path: str, overrides: dict | None = None):
                 print(f"  -> New best model saved! (inst_acc: {best_inst_acc:.4f})")
 
             last_completed_epoch = epoch
+            _save_config_snapshot(config, output_dir)
             _save_training_checkpoint(
                 checkpoint_path=checkpoint_path,
                 model=model,
@@ -501,6 +504,56 @@ def _move_optimizer_state(optimizer, device):
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
+
+
+def _resolve_output_dir(config: dict) -> str:
+    """Resolve the run directory for a training config."""
+    return str(config.get("output_dir") or os.path.join("runs", config["model"]))
+
+
+def _save_config_snapshot(config: dict, output_dir: str) -> None:
+    """Save the effective config used by a run for later inspection."""
+    snapshot_path = os.path.join(output_dir, "config_snapshot.yaml")
+    with open(snapshot_path, "w") as f:
+        yaml.safe_dump(config, f, sort_keys=True)
+
+
+_RESUME_CONFIG_KEYS = (
+    "model",
+    "num_points",
+    "use_normals",
+    "rotation_mode",
+    "width",
+    "blocks",
+    "strides",
+    "nsample",
+    "expansion",
+    "k",
+    "emb_dims",
+    "dropout",
+)
+
+
+def _check_resume_config_compatible(config: dict, checkpoint_path: str | Path) -> None:
+    """Refuse to resume a run whose architecture/data config differs."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    old_config = checkpoint.get("config") or {}
+    mismatches = []
+    for key in _RESUME_CONFIG_KEYS:
+        if old_config.get(key) != config.get(key):
+            mismatches.append((key, old_config.get(key), config.get(key)))
+
+    if mismatches:
+        details = "\n".join(
+            f"  {key}: checkpoint={old!r}, current={new!r}"
+            for key, old, new in mismatches
+        )
+        raise RuntimeError(
+            "Refusing to resume from an incompatible training checkpoint: "
+            f"{checkpoint_path}\n"
+            f"{details}\n"
+            "Use a different output_dir or move/remove the existing run directory."
+        )
 
 
 def _load_training_checkpoint(path: str) -> dict:
