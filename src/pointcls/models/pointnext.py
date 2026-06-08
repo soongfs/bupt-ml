@@ -12,7 +12,18 @@ import torch
 import torch.nn as nn
 
 from pointcls.data.dataset import farthest_point_sample
-from pointcls.models.pointmlp import index_points, knn_points
+from pointcls.models.pointmlp import knn_points
+
+
+def index_points_bcn(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """Gather channel-first points/features (B, C, N) by indices (B, S[, K])."""
+    B, C, _ = points.shape
+    flat_idx = idx.reshape(B, -1)
+    gather_idx = flat_idx.unsqueeze(1).expand(-1, C, -1)
+    gathered = torch.gather(points, 2, gather_idx)
+    if idx.ndim == 2:
+        return gathered.view(B, C, idx.shape[1])
+    return gathered.view(B, C, idx.shape[1], idx.shape[2])
 
 
 class ConvBNAct1d(nn.Sequential):
@@ -70,8 +81,8 @@ class LocalAggregation(nn.Module):
         B, C, N = features.shape
         k = min(self.nsample, N)
         idx = knn_points(xyz, k=k)  # (B, N, k), xyz-only graph
-        grouped_feat = index_points(features, idx)  # (B, C, N, k)
-        grouped_xyz = index_points(xyz, idx)  # (B, 3, N, k)
+        grouped_feat = index_points_bcn(features, idx)  # (B, C, N, k)
+        grouped_xyz = index_points_bcn(xyz, idx)  # (B, 3, N, k)
         center_feat = features.unsqueeze(-1).expand(-1, -1, -1, k)
         center_xyz = xyz.unsqueeze(-1).expand(-1, -1, -1, k)
         edge = torch.cat(

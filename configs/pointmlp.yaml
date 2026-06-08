@@ -1,19 +1,30 @@
 model: pointmlp
 output_dir: runs/pointmlp
 num_points: 1024
-use_normals: false
+use_normals: true
 rotation_mode: z
+embed_dim: 64
+groups: 1
+res_expansion: 1.0
+activation: relu
+bias: false
+use_xyz: false
+normalize: anchor
+dim_expansion: [2, 2, 2, 2]
+pre_blocks: [2, 2, 2, 2]
+pos_blocks: [2, 2, 2, 2]
+k_neighbors: [24, 24, 24, 24]
+reducers: [2, 2, 2, 2]
 dropout: 0.5
-batch_size: 128
+batch_size: 64
 epochs: 300
 optimizer: AdamW
 lr: 0.001
 weight_decay: 0.0001
 scheduler: CosineAnnealingLR
 scheduler_T_max: 300
-label_smoothing: 0.2
+label_smoothing: 0.1
 num_workers: 0
 prefetch_factor: 2
 seed: 42
-elite: true
-gpu_reserve_mb: 35000
+gpu_reserve_mb: 5000

@@ -531,6 +531,17 @@ _RESUME_CONFIG_KEYS = (
     "k",
     "emb_dims",
     "dropout",
+    "label_smoothing",
+    "embed_dim",
+    "groups",
+    "res_expansion",
+    "use_xyz",
+    "normalize",
+    "dim_expansion",
+    "pre_blocks",
+    "pos_blocks",
+    "k_neighbors",
+    "reducers",
 )
 
 

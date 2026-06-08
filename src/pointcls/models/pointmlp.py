@@ -1,8 +1,19 @@
-"""PointMLP: Rethinking Network Design and Local Geometry in Point Cloud.
+"""Full PointMLP implementation for ModelNet40 classification.
 
-Reference: "Rethinking Network Design and Local Geometry in Point Cloud:
-A Simple Residual MLP Framework" (Ma et al., 2022)
+This follows the core design of "Rethinking Network Design and Local Geometry in
+Point Cloud" (Ma et al., 2022): FPS local grouping, kNN neighborhoods, anchor or
+center normalization with learnable affine parameters, pre-extraction residual
+MLP blocks on each local group, post-extraction residual MLP blocks on sampled
+points, and a global classification head.
+
+The previous in-repo PointMLP was a simplified approximation. This file keeps the
+public class name `PointMLP` but implements the full local-group/pre/post block
+pipeline.
 """
+
+from __future__ import annotations
+
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
@@ -11,282 +22,413 @@ import torch.nn.functional as F
 from pointcls.data.dataset import farthest_point_sample
 
 
-def knn_points(x: torch.Tensor, k: int) -> torch.Tensor:
-    """Compute k-nearest neighbors in 3D space.
+def get_activation(name: str) -> nn.Module:
+    name = name.lower()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "rrelu":
+        return nn.RReLU(inplace=True)
+    if name == "selu":
+        return nn.SELU(inplace=True)
+    if name == "silu":
+        return nn.SiLU(inplace=True)
+    if name == "hardswish":
+        return nn.Hardswish(inplace=True)
+    if name == "leakyrelu":
+        return nn.LeakyReLU(inplace=True)
+    return nn.ReLU(inplace=True)
+
+
+def square_distance(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+    """Pairwise squared Euclidean distance.
 
     Args:
-        x: Tensor of shape (B, 3, N).
-        k: Number of neighbors.
+        src: (B, N, C)
+        dst: (B, M, C)
 
     Returns:
-        Tensor of shape (B, N, k) containing indices of nearest neighbors.
+        (B, N, M)
     """
-    B, C, N = x.shape
-    # (B, N, N)
-    inner = 2 * torch.matmul(x.transpose(2, 1), x)
-    xx = (x ** 2).sum(dim=1, keepdim=True)
-    pairwise = xx.transpose(2, 1) + xx - inner
-
-    _, idx = pairwise.topk(k=k, dim=-1, largest=False)
-    return idx
+    dist = -2 * torch.matmul(src, dst.transpose(2, 1))
+    dist = dist + torch.sum(src ** 2, dim=-1, keepdim=True)
+    dist = dist + torch.sum(dst ** 2, dim=-1).unsqueeze(1)
+    return dist
 
 
 def index_points(points: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """Gather points by indices.
+    """Gather batched points by batched indices.
+
+    Accepts either (B, N, C) point layout (PointMLP) or the legacy (B, C, N)
+    layout used by PointNeXt in this project. For 3D indices, returns
+    (B, S, K, C) for BNC input and (B, C, S, K) for BCN input.
+    """
+    if points.ndim != 3:
+        raise ValueError("points must be a 3D tensor")
+
+    if idx.numel() == 0:
+        raise ValueError("idx must be non-empty")
+
+    idx_max = int(idx.max().item())
+    # Legacy project helper behavior: PointNeXt passes features as (B, C, N).
+    # If idx cannot index axis 1 but can index axis 2, gather over axis 2 and
+    # return channel-first grouped tensors.
+    if idx_max >= points.shape[1] and idx_max < points.shape[2]:
+        batch_size, channels, num_points = points.shape
+        flat_idx = idx.reshape(batch_size, -1)
+        gather_idx = flat_idx.unsqueeze(1).expand(-1, channels, -1)
+        gathered = torch.gather(points, 2, gather_idx)
+        if idx.ndim == 2:
+            return gathered.view(batch_size, channels, idx.shape[1])
+        return gathered.view(batch_size, channels, idx.shape[1], idx.shape[2])
+
+    device = points.device
+    batch_size = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(batch_size, dtype=torch.long, device=device).view(view_shape)
+    batch_indices = batch_indices.repeat(repeat_shape)
+    return points[batch_indices, idx, :]
+
+
+def knn_point(k: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
+    """kNN query from new_xyz centers into xyz points.
 
     Args:
-        points: (B, C, N)
-        idx: (B, M) or (B, M, k)
+        k: number of neighbors
+        xyz: (B, N, 3)
+        new_xyz: (B, S, 3)
 
     Returns:
-        Gathered points of shape matching idx expansion.
+        (B, S, k) neighbor indices.
     """
-    B, C, N = points.shape
-    idx_shape = idx.shape
-
-    # Flatten idx
-    idx = idx.reshape(B, -1)
-    batch_indices = torch.arange(B, device=points.device).view(-1, 1) * N
-    idx = idx + batch_indices
-    idx = idx.view(-1)
-
-    points = points.transpose(2, 1).contiguous()  # (B, N, C)
-    gathered = points.view(B * N, -1)[idx, :]  # (B*M*k, C) or (B*M, C)
-    gathered = gathered.view(B, *idx_shape[1:], C)
-    gathered = gathered.permute(0, 3, 1, 2).contiguous()  # (B, C, M, k) or (B, C, M)
-
-    return gathered
+    k = min(k, xyz.shape[1])
+    dist = square_distance(new_xyz, xyz)
+    _, group_idx = torch.topk(dist, k=k, dim=-1, largest=False, sorted=False)
+    return group_idx
 
 
-class GeometricAffine(nn.Module):
-    """Geometric Affine transformation for local point groups.
+def knn_points(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Backward-compatible kNN helper for tensors in (B, C, N) layout."""
+    idx = knn_point(k, x.transpose(2, 1).contiguous(), x.transpose(2, 1).contiguous())
+    return idx
 
-    For each local group of points:
-    1. Compute centroid
-    2. Center points by subtracting centroid
-    3. Apply learned affine transform
-    4. Add centroid back
-    """
 
-    def __init__(self, channels: int, coord_channels: int = 3):
+class ConvBNReLU1D(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 1,
+        bias: bool = True,
+        activation: str = "relu",
+    ):
         super().__init__()
-        # Two-layer affine: learn scale + bias per channel for each group
-        self.affine_alpha = nn.Sequential(
-            nn.Conv1d(coord_channels, channels, kernel_size=1),
-            nn.BatchNorm1d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(channels, channels, kernel_size=1),
-        )
-        self.affine_beta = nn.Sequential(
-            nn.Conv1d(coord_channels, channels, kernel_size=1),
-            nn.BatchNorm1d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(channels, channels, kernel_size=1),
-        )
-
-    def forward(self, x: torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, N) — features
-            centroids: (B, 3, N) — centroid coordinates
-
-        Returns:
-            (B, C, N)
-        """
-        # alpha and beta from centroids (position-dependent)
-        alpha = torch.tanh(self.affine_alpha(centroids))  # (B, C, N)
-        beta = torch.tanh(self.affine_beta(centroids))    # (B, C, N)
-
-        # Apply affine: alpha * (x - mu) + beta + mu  (but we simplify)
-        # Standard geometric affine: y = alpha⊙x + beta
-        return alpha * x + beta
-
-
-class LocalGrouper(nn.Module):
-    """FPS downsampling + kNN grouping to form local patches."""
-
-    def __init__(self, npoints: int, k: int):
-        """
-        Args:
-            npoints: Number of points after FPS downsampling.
-            k: Number of neighbors for kNN grouping.
-        """
-        super().__init__()
-        self.npoints = npoints
-        self.k = k
-
-    def forward(self, xyz: torch.Tensor, features: torch.Tensor):
-        """
-        Args:
-            xyz: (B, 3, N) — point coordinates
-            features: (B, C, N) — point features (can be xyz for first layer)
-
-        Returns:
-            new_xyz: (B, 3, npoints) — downsampled centroids
-            grouped_features: (B, C, npoints, k) — local groups
-        """
-        B, C, N = features.shape
-
-        # FPS downsampling
-        fps_idx = farthest_point_sample(xyz.transpose(2, 1).contiguous(), self.npoints)
-        fps_idx = fps_idx.unsqueeze(2).expand(-1, -1, 3)  # (B, npoints, 3)
-        new_xyz = torch.gather(xyz.transpose(2, 1), 1, fps_idx).transpose(2, 1)  # (B, 3, npoints)
-
-        # kNN grouping
-        knn_idx = knn_points(xyz, self.k)  # (B, N, k)
-
-        # Gather FPS indices' neighbors
-        fps_idx_for_gather = fps_idx[:, :, 0].unsqueeze(-1).expand(-1, -1, self.k)  # (B, npoints, k)
-        batch_indices = torch.arange(B, device=xyz.device).view(-1, 1, 1)
-        # Get neighbor indices for each centroid
-        centroid_neighbors = torch.gather(knn_idx, 1, fps_idx_for_gather)  # (B, npoints, k)
-
-        # Gather features
-        grouped_features = index_points(features, centroid_neighbors)  # (B, C, npoints, k)
-
-        return new_xyz, grouped_features
-
-
-class ResMLPBlock(nn.Module):
-    """Residual MLP block: 2-layer MLP with residual connection."""
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, bias=bias),
+            nn.BatchNorm1d(out_channels),
+            get_activation(activation),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, npoints, k)
-
-        Returns:
-            (B, C, npoints, k)
-        """
-        return x + self.mlp(x)
+        return self.net(x)
 
 
-class PointMLPStage(nn.Module):
-    """One stage of PointMLP: LocalGrouper + GeometricAffine + ResMLPBlock."""
-
-    def __init__(self, in_channels: int, out_channels: int, npoints: int, k: int):
+class ConvBNReLURes1D(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 1,
+        groups: int = 1,
+        res_expansion: float = 1.0,
+        bias: bool = True,
+        activation: str = "relu",
+    ):
         super().__init__()
-        self.grouper = LocalGrouper(npoints, k)
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        ) if in_channels != out_channels else nn.Identity()
-        self.geo_affine = GeometricAffine(out_channels, coord_channels=3)
-        self.res_mlp = ResMLPBlock(out_channels)
+        hidden_channels = int(channels * res_expansion)
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, hidden_channels, kernel_size=kernel_size, groups=groups, bias=bias),
+            nn.BatchNorm1d(hidden_channels),
+            get_activation(activation),
+            nn.Conv1d(hidden_channels, channels, kernel_size=kernel_size, groups=groups, bias=bias),
+            nn.BatchNorm1d(channels),
+        )
+        self.act = get_activation(activation)
 
-    def forward(self, xyz: torch.Tensor, features: torch.Tensor):
-        """
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.net(x) + x)
+
+
+class LocalGrouper(nn.Module):
+    """FPS downsampling plus kNN local grouping with PointMLP normalization."""
+
+    def __init__(
+        self,
+        channel: int,
+        groups: int,
+        kneighbors: int,
+        use_xyz: bool = True,
+        normalize: str | None = "center",
+    ):
+        super().__init__()
+        self.groups = groups
+        self.kneighbors = kneighbors
+        self.use_xyz = use_xyz
+        self.normalize = normalize.lower() if normalize is not None else None
+        if self.normalize not in {"center", "anchor", None}:
+            raise ValueError("normalize must be one of: center, anchor, None")
+
+        if self.normalize is not None:
+            add_channel = 3 if use_xyz else 0
+            self.affine_alpha = nn.Parameter(torch.ones(1, 1, 1, channel + add_channel))
+            self.affine_beta = nn.Parameter(torch.zeros(1, 1, 1, channel + add_channel))
+
+    def forward(self, xyz: torch.Tensor, points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Group local neighborhoods.
+
         Args:
-            xyz: (B, 3, N)
-            features: (B, C, N)
+            xyz: (B, N, 3)
+            points: (B, N, C)
 
         Returns:
-            new_xyz: (B, 3, npoints)
-            new_features: (B, Cout, npoints)
+            new_xyz: (B, groups, 3)
+            new_points: (B, groups, kneighbors, 2*C + (3 if use_xyz else 0))
         """
-        # Group
-        new_xyz, grouped_feat = self.grouper(xyz, features)  # (B, C, npoints, k)
+        batch_size, num_points, _ = xyz.shape
+        groups = min(self.groups, num_points)
 
-        # Project
-        grouped_feat = self.proj(grouped_feat)  # (B, Cout, npoints, k)
+        fps_idx = farthest_point_sample(xyz.contiguous(), groups).long()
+        new_xyz = index_points(xyz, fps_idx)
+        new_points = index_points(points, fps_idx)
 
-        # Geometric Affine: apply per-point, using centroid xyz
-        B, C, np, k = grouped_feat.shape
-        # Need centroids in feature space — just use new_xyz for affine
-        # Apply affine to each neighbor point individually
-        # For simplicity, apply affine after max-pooling (common simplification)
-        # Actually the paper applies it as attention on centroids
-        # We'll apply it to the max-pooled features
-        max_feat = grouped_feat.max(dim=-1)[0]  # (B, Cout, npoints)
-        max_feat = self.geo_affine(max_feat, new_xyz)  # (B, Cout, npoints)
+        idx = knn_point(self.kneighbors, xyz, new_xyz)
+        grouped_xyz = index_points(xyz, idx)
+        grouped_points = index_points(points, idx)
 
-        # Residual MLP on grouped features then max-pool
-        grouped_feat = self.res_mlp(grouped_feat)  # (B, Cout, npoints, k)
-        pooled = grouped_feat.max(dim=-1)[0]  # (B, Cout, npoints)
+        if self.use_xyz:
+            grouped_points = torch.cat([grouped_points, grouped_xyz], dim=-1)
 
-        # Combine
-        out = pooled + max_feat  # (B, Cout, npoints)
+        if self.normalize is not None:
+            if self.normalize == "center":
+                mean = grouped_points.mean(dim=2, keepdim=True)
+            else:
+                mean = torch.cat([new_points, new_xyz], dim=-1) if self.use_xyz else new_points
+                mean = mean.unsqueeze(2)
+            std = torch.std((grouped_points - mean).reshape(batch_size, -1), dim=-1)
+            std = std.view(batch_size, 1, 1, 1)
+            grouped_points = (grouped_points - mean) / (std + 1e-5)
+            grouped_points = self.affine_alpha * grouped_points + self.affine_beta
 
-        return new_xyz, out
+        repeated_centers = new_points.unsqueeze(2).repeat(1, 1, idx.shape[-1], 1)
+        new_points = torch.cat([grouped_points, repeated_centers], dim=-1)
+        return new_xyz, new_points
+
+
+class PreExtraction(nn.Module):
+    """Process each local group independently and max-pool over neighbors."""
+
+    def __init__(
+        self,
+        channels: int,
+        out_channels: int,
+        blocks: int = 1,
+        groups: int = 1,
+        res_expansion: float = 1.0,
+        bias: bool = True,
+        activation: str = "relu",
+        use_xyz: bool = True,
+    ):
+        super().__init__()
+        in_channels = 3 + 2 * channels if use_xyz else 2 * channels
+        self.transfer = ConvBNReLU1D(in_channels, out_channels, bias=bias, activation=activation)
+        self.operation = nn.Sequential(
+            *[
+                ConvBNReLURes1D(
+                    out_channels,
+                    groups=groups,
+                    res_expansion=res_expansion,
+                    bias=bias,
+                    activation=activation,
+                )
+                for _ in range(blocks)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, groups, k, d) -> (B, out_channels, groups)
+        batch_size, groups, neighbors, channels = x.shape
+        x = x.permute(0, 1, 3, 2).reshape(-1, channels, neighbors)
+        x = self.transfer(x)
+        x = self.operation(x)
+        x = F.adaptive_max_pool1d(x, 1).view(batch_size, groups, -1)
+        return x.permute(0, 2, 1).contiguous()
+
+
+class PosExtraction(nn.Module):
+    """Residual MLP blocks across sampled points after local pooling."""
+
+    def __init__(
+        self,
+        channels: int,
+        blocks: int = 1,
+        groups: int = 1,
+        res_expansion: float = 1.0,
+        bias: bool = True,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        self.operation = nn.Sequential(
+            *[
+                ConvBNReLURes1D(
+                    channels,
+                    groups=groups,
+                    res_expansion=res_expansion,
+                    bias=bias,
+                    activation=activation,
+                )
+                for _ in range(blocks)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.operation(x)
+
+
+def _as_tuple(values: Sequence[int] | int, stages: int, name: str) -> tuple[int, ...]:
+    if isinstance(values, int):
+        return (values,) * stages
+    values = tuple(values)
+    if len(values) != stages:
+        raise ValueError(f"{name} must have length {stages}, got {len(values)}")
+    return values
 
 
 class PointMLP(nn.Module):
-    """PointMLP for point cloud classification."""
+    """Full PointMLP classifier.
+
+    Args:
+        input_dim: 3 for xyz only, 6 for xyz+normals. Normals are embedded as
+            additional input attributes; xyz remains the geometry used for FPS/kNN.
+    """
 
     def __init__(
         self,
         num_classes: int = 40,
-        use_normals: bool = False,
-        elite: bool = True,
+        input_dim: int | None = None,
+        use_normals: bool | None = None,
+        points: int = 1024,
+        embed_dim: int = 64,
+        groups: int = 1,
+        res_expansion: float = 1.0,
+        activation: str = "relu",
+        bias: bool = False,
+        use_xyz: bool = False,
+        normalize: str | None = "anchor",
+        dim_expansion: Sequence[int] = (2, 2, 2, 2),
+        pre_blocks: Sequence[int] = (2, 2, 2, 2),
+        pos_blocks: Sequence[int] = (2, 2, 2, 2),
+        k_neighbors: Sequence[int] = (24, 24, 24, 24),
+        reducers: Sequence[int] = (2, 2, 2, 2),
         dropout: float = 0.5,
+        elite: bool | None = None,
     ):
         super().__init__()
-        input_dim = 6 if use_normals else 3
+        if input_dim is None:
+            input_dim = 6 if use_normals else 3
+        if input_dim not in {3, 6}:
+            raise ValueError("PointMLP input_dim must be 3 or 6")
 
-        if elite:
-            emb_dims = [128, 256, 512, 1024]
-        else:
-            emb_dims = [64, 128, 256, 512]
+        if elite is True:
+            embed_dim = 32
+            res_expansion = 0.25
+            dim_expansion = (2, 2, 2, 1)
+            pre_blocks = (1, 1, 2, 1)
+            pos_blocks = (1, 1, 2, 1)
+        elif elite is False:
+            # Full/default PointMLP setting from the reference implementation.
+            embed_dim = embed_dim
 
-        npoints_list = [512, 256, 128, 64]
-        k_list = [24, 24, 12, 12]
+        stages = len(pre_blocks)
+        dim_expansion = _as_tuple(dim_expansion, stages, "dim_expansion")
+        pos_blocks = _as_tuple(pos_blocks, stages, "pos_blocks")
+        k_neighbors = _as_tuple(k_neighbors, stages, "k_neighbors")
+        reducers = _as_tuple(reducers, stages, "reducers")
 
-        self.stage1 = PointMLPStage(input_dim, emb_dims[0], npoints_list[0], k_list[0])
-        self.stage2 = PointMLPStage(emb_dims[0], emb_dims[1], npoints_list[1], k_list[1])
-        self.stage3 = PointMLPStage(emb_dims[1], emb_dims[2], npoints_list[2], k_list[2])
-        self.stage4 = PointMLPStage(emb_dims[2], emb_dims[3], npoints_list[3], k_list[3])
+        self.input_dim = input_dim
+        self.stages = stages
+        self.points = points
+        self.embedding = ConvBNReLU1D(input_dim, embed_dim, bias=bias, activation=activation)
 
-        # After 4 stages we have emb_dims[3] channels, max+avg pool -> 2*emb_dims[3]
-        pool_dim = emb_dims[3] * 2
+        self.local_grouper_list = nn.ModuleList()
+        self.pre_blocks_list = nn.ModuleList()
+        self.pos_blocks_list = nn.ModuleList()
 
+        last_channel = embed_dim
+        anchor_points = points
+        for i in range(stages):
+            out_channel = last_channel * dim_expansion[i]
+            anchor_points = max(anchor_points // reducers[i], 1)
+            self.local_grouper_list.append(
+                LocalGrouper(last_channel, anchor_points, k_neighbors[i], use_xyz, normalize)
+            )
+            self.pre_blocks_list.append(
+                PreExtraction(
+                    last_channel,
+                    out_channel,
+                    blocks=pre_blocks[i],
+                    groups=groups,
+                    res_expansion=res_expansion,
+                    bias=bias,
+                    activation=activation,
+                    use_xyz=use_xyz,
+                )
+            )
+            self.pos_blocks_list.append(
+                PosExtraction(
+                    out_channel,
+                    blocks=pos_blocks[i],
+                    groups=groups,
+                    res_expansion=res_expansion,
+                    bias=bias,
+                    activation=activation,
+                )
+            )
+            last_channel = out_channel
+
+        act = get_activation(activation)
         self.classifier = nn.Sequential(
-            nn.Linear(pool_dim, 256),
+            nn.Linear(last_channel, 512),
+            nn.BatchNorm1d(512),
+            act,
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
             nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
+            get_activation(activation),
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
         )
 
+    def _to_bcn(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError("PointMLP input must be a 3D tensor")
+        if x.shape[1] == self.input_dim:
+            return x.contiguous()
+        if x.shape[2] == self.input_dim:
+            return x.transpose(2, 1).contiguous()
+        raise ValueError(
+            f"PointMLP expected input_dim={self.input_dim} on axis 1 or 2, got shape {tuple(x.shape)}"
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, 3, N) or (B, N, 3)
+        x = self._to_bcn(x)
+        xyz = x[:, :3, :].transpose(2, 1).contiguous()  # (B, N, 3)
+        features = self.embedding(x)  # (B, D, N)
 
-        Returns:
-            logits: (B, num_classes)
-        """
-        # Ensure (B, 3, N) format
-        if x.shape[1] != 3 and x.shape[2] == 3:
-            x = x.transpose(2, 1).contiguous()
-        elif x.shape[1] == 3:
-            pass
-        else:
-            pass
+        for i in range(self.stages):
+            xyz, grouped = self.local_grouper_list[i](xyz, features.transpose(2, 1).contiguous())
+            features = self.pre_blocks_list[i](grouped)
+            features = self.pos_blocks_list[i](features)
 
-        xyz = x[:, :3, :]  # Always use first 3 as coordinates
-        features = x  # Can be (B, 3, N) or (B, 6, N)
-
-        xyz1, feat1 = self.stage1(xyz, features)
-        xyz2, feat2 = self.stage2(xyz1, feat1)
-        xyz3, feat3 = self.stage3(xyz2, feat2)
-        xyz4, feat4 = self.stage4(xyz3, feat3)
-
-        # Global pooling
-        max_pool = feat4.max(dim=2)[0]  # (B, C)
-        avg_pool = feat4.mean(dim=2)    # (B, C)
-        pooled = torch.cat([max_pool, avg_pool], dim=1)  # (B, 2*C)
-
-        logits = self.classifier(pooled)
-        return logits
+        features = F.adaptive_max_pool1d(features, 1).squeeze(-1)
+        return self.classifier(features)
