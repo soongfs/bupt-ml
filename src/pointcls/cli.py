@@ -13,13 +13,18 @@ def cli():
 @click.option(
     "--data-dir",
     default="data/modelnet40",
-    help="Directory to download/extract ModelNet40.",
+    help="Directory to download/extract Pointcept ModelNet40 TXT data.",
     show_default=True,
 )
-def download(data_dir: str):
-    """Download and extract ModelNet40 dataset."""
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Remove and re-download the target directory if it already exists.",
+)
+def download(data_dir: str, force: bool):
+    """Download Pointcept ModelNet40 normal-resampled TXT data from HuggingFace."""
     from pointcls.data.download import download_modelnet40
-    download_modelnet40(data_dir)
+    download_modelnet40(data_dir, force=force)
 
 
 @cli.command()

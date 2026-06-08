@@ -1,121 +1,143 @@
-"""ModelNet40 dataset download and extraction."""
+"""Download and verify the Pointcept ModelNet40 normal-resampled dataset."""
+
+from __future__ import annotations
 
 import os
 import shutil
 import sys
+from pathlib import Path
 
 DEFAULT_DATA_DIR = "data/modelnet40"
-HF_REPO = "naderalfares/ModelNet40"
+HF_REPO = "Pointcept/modelnet40_normal_resampled-compressed"
+HF_ENDPOINT = "https://hf-mirror.com"
+EXPECTED_NUM_CLASSES = 40
+EXPECTED_NUM_SAMPLES = 9843
+METADATA_FILES = {
+    "filelist.txt",
+    "modelnet40_shape_names.txt",
+    "modelnet40_train.txt",
+    "modelnet40_test.txt",
+}
 
 
-def verify_modelnet40(data_dir: str) -> bool:
-    """Check that 40 class dirs exist with valid data files.
-
-    Accepts two layouts:
-    - Split: each class dir has train/ and test/ subdirectories.
-    - Unsplit: each class dir contains .txt or .off files directly.
-    """
-    if not os.path.isdir(data_dir):
-        return False
-    subdirs = [d for d in os.listdir(data_dir)
-               if os.path.isdir(os.path.join(data_dir, d))
-               and not d.startswith("_") and not d.startswith(".")
-               and d not in ("ModelNet40", "modelnet40", "__MACOSX")]
-    if len(subdirs) < 40:
-        return False
-
-    # Split layout: class/train/ + class/test/
-    split_ok = all(
-        os.path.isdir(os.path.join(data_dir, d, "train")) and
-        os.path.isdir(os.path.join(data_dir, d, "test"))
-        for d in subdirs
+def _class_dirs(root: Path) -> list[Path]:
+    return sorted(
+        p for p in root.iterdir()
+        if p.is_dir()
+        and not p.name.startswith(".")
+        and not p.name.startswith("_")
+        and p.name.lower() not in {"modelnet40", "__macosx"}
     )
-    if split_ok:
-        return True
-
-    # Unsplit layout: class/*.txt or class/*.off
-    unsplit_ok = all(
-        any(
-            f.endswith((".txt", ".off"))
-            for f in os.listdir(os.path.join(data_dir, d))
-            if os.path.isfile(os.path.join(data_dir, d, f))
-        )
-        for d in subdirs
-    )
-    return unsplit_ok
 
 
-def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR):
-    os.makedirs(data_dir, exist_ok=True)
+def _is_modelnet40_root(path: str | Path) -> bool:
+    root = Path(path)
+    if not root.is_dir():
+        return False
+    classes = _class_dirs(root)
+    if len(classes) != EXPECTED_NUM_CLASSES:
+        return False
+    return all(any(cls.glob("*.txt")) for cls in classes)
 
-    if verify_modelnet40(data_dir):
-        print(f"ModelNet40 already exists at {data_dir}")
+
+def verify_modelnet40(data_dir: str = DEFAULT_DATA_DIR) -> bool:
+    """Return True only for the Pointcept unsplit 40-class TXT layout."""
+    return _is_modelnet40_root(data_dir)
+
+
+def _find_modelnet40_root(search_root: str | Path) -> Path | None:
+    """Find the directory containing the 40 Pointcept class directories."""
+    root = Path(search_root)
+    candidates = [root]
+    candidates.extend(p for p in root.rglob("*") if p.is_dir())
+    for candidate in candidates:
+        if _is_modelnet40_root(candidate):
+            return candidate
+    return None
+
+
+def _clean_metadata_files(root: Path) -> None:
+    for name in METADATA_FILES:
+        path = root / name
+        if path.exists() and path.is_file():
+            path.unlink()
+
+
+def _count_sample_txt(root: Path) -> int:
+    return sum(len(list(cls.glob("*.txt"))) for cls in _class_dirs(root))
+
+
+def _replace_dir(src: Path, dst: Path) -> None:
+    if dst.exists():
+        shutil.rmtree(dst)
+    if src.resolve() == dst.resolve():
         return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
 
-    # Remove previous Pointcept data (txt format), keep partial OFF downloads
-    if os.path.isdir(data_dir):
-        has_off = any(
-            f.endswith(".off") for f in os.listdir(data_dir)
-            if os.path.isfile(os.path.join(data_dir, f))
-        )
-        has_txt = any(
-            f.endswith(".txt") for f in os.listdir(data_dir)
-            if os.path.isfile(os.path.join(data_dir, f))
-        )
-        if has_txt and not has_off:
-            print("Removing old Pointcept dataset...")
-            shutil.rmtree(data_dir)
-            os.makedirs(data_dir)
-        elif verify_modelnet40(data_dir):
-            print(f"ModelNet40 already exists at {data_dir}")
-            return
 
-    print(f"Downloading {HF_REPO} from HuggingFace...")
+def download_modelnet40(data_dir: str = DEFAULT_DATA_DIR, force: bool = False) -> None:
+    """Download Pointcept/modelnet40_normal_resampled-compressed from HuggingFace.
+
+    The final directory is normalized to:
+        data_dir/class_name/class_name_0001.txt
+
+    No Baidu Pan, OFF mesh, or alternate dataset fallback is used.
+    """
+    target = Path(data_dir)
+    if target.exists() and verify_modelnet40(str(target)) and not force:
+        print(f"ModelNet40 already exists at {target}")
+        return
+    if target.exists() and force:
+        shutil.rmtree(target)
+
+    tmp_dir = target.parent / f".{target.name}_hf_download"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading {HF_REPO} from HuggingFace to {tmp_dir}...")
+    os.environ.setdefault("HF_ENDPOINT", HF_ENDPOINT)
     try:
-        # Use hf-mirror.com in China for better speed/stability
-        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
         from huggingface_hub import snapshot_download
+    except ImportError:
+        print("huggingface_hub not installed. Install dependencies with: uv sync")
+        sys.exit(1)
+
+    try:
         snapshot_download(
             repo_id=HF_REPO,
             repo_type="dataset",
-            local_dir=data_dir,
+            local_dir=str(tmp_dir),
+            allow_patterns="*.txt",
             max_workers=1,
         )
-    except ImportError:
-        print("huggingface_hub not installed. Run: uv add huggingface_hub")
-        sys.exit(1)
     except Exception as e:
         print(f"Download failed: {e}")
-        print("Try the Pointcept fallback or Baidu Pan.")
         sys.exit(1)
 
-    # Flatten: the repo has a top-level "ModelNet40/" directory.
-    # Only move class subdirectories (those containing train/ and test/).
-    nested = os.path.join(data_dir, "ModelNet40")
-    if os.path.isdir(nested):
-        for item in os.listdir(nested):
-            src = os.path.join(nested, item)
-            if not os.path.isdir(src):
-                continue
-            if not (os.path.isdir(os.path.join(src, "train")) and
-                    os.path.isdir(os.path.join(src, "test"))):
-                continue  # Skip metadata dirs like "data/"
-            dst = os.path.join(data_dir, item)
-            if os.path.exists(dst):
-                if os.path.isdir(dst):
-                    shutil.rmtree(dst)
-                else:
-                    os.remove(dst)
-            shutil.move(src, dst)
-        shutil.rmtree(nested)
-        print("  Flattened directory structure.")
-
-    if verify_modelnet40(data_dir):
-        print(f"ModelNet40 ready at {data_dir} (40 classes, train/test splits).")
-    else:
-        print("WARNING: Dataset verification failed.")
-        for item in sorted(os.listdir(data_dir)):
+    found = _find_modelnet40_root(tmp_dir)
+    if found is None:
+        print("Dataset verification failed: could not find 40 class TXT directories.")
+        print("Downloaded files:")
+        for item in sorted(tmp_dir.rglob("*"))[:100]:
             print(f"  {item}")
+        sys.exit(1)
+
+    _clean_metadata_files(found)
+    _replace_dir(found, target)
+    if tmp_dir.exists() and tmp_dir != target:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not verify_modelnet40(str(target)):
+        print("Dataset verification failed after normalization.")
+        sys.exit(1)
+
+    sample_count = _count_sample_txt(target)
+    print(f"ModelNet40 ready at {target}")
+    print(f"Classes: {len(_class_dirs(target))}; samples: {sample_count}")
+    if sample_count != EXPECTED_NUM_SAMPLES:
+        print(f"WARNING: expected {EXPECTED_NUM_SAMPLES} samples, got {sample_count}")
 
 
 if __name__ == "__main__":
