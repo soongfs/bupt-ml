@@ -223,14 +223,21 @@ def train_model(config_path: str, overrides: dict | None = None):
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif optimizer_name == "AdamW":
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "SGD":
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=config.get("momentum", 0.9),
+            weight_decay=weight_decay,
+        )
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
     # Scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.get("scheduler_T_max", 250),
-    )
+    scheduler_kwargs = {"T_max": config.get("scheduler_T_max", 250)}
+    if "min_lr" in config:
+        scheduler_kwargs["eta_min"] = config["min_lr"]
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, **scheduler_kwargs)
 
     # Output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -302,6 +309,9 @@ def train_model(config_path: str, overrides: dict | None = None):
                     logits = model(points)
                     loss = criterion(logits, labels)
                     loss.backward()
+                    grad_clip_norm = config.get("grad_clip_norm")
+                    if grad_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                     optimizer.step()
 
                     batch_size = labels.size(0)
@@ -542,6 +552,9 @@ _RESUME_CONFIG_KEYS = (
     "pos_blocks",
     "k_neighbors",
     "reducers",
+    "momentum",
+    "min_lr",
+    "grad_clip_norm",
 )
 
 

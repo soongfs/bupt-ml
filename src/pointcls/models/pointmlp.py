@@ -147,17 +147,28 @@ class ConvBNReLURes1D(nn.Module):
     ):
         super().__init__()
         hidden_channels = int(channels * res_expansion)
-        self.net = nn.Sequential(
+        self.act = get_activation(activation)
+        self.net1 = nn.Sequential(
             nn.Conv1d(channels, hidden_channels, kernel_size=kernel_size, groups=groups, bias=bias),
             nn.BatchNorm1d(hidden_channels),
-            get_activation(activation),
-            nn.Conv1d(hidden_channels, channels, kernel_size=kernel_size, groups=groups, bias=bias),
-            nn.BatchNorm1d(channels),
+            self.act,
         )
-        self.act = get_activation(activation)
+        if groups > 1:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(hidden_channels, channels, kernel_size=kernel_size, groups=groups, bias=bias),
+                nn.BatchNorm1d(channels),
+                self.act,
+                nn.Conv1d(channels, channels, kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channels),
+            )
+        else:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(hidden_channels, channels, kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channels),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.net(x) + x)
+        return self.act(self.net2(self.net1(x)) + x)
 
 
 class LocalGrouper(nn.Module):
@@ -305,11 +316,11 @@ def _as_tuple(values: Sequence[int] | int, stages: int, name: str) -> tuple[int,
 
 
 class PointMLP(nn.Module):
-    """Full PointMLP classifier.
+    """Official PointMLP classifier.
 
-    Args:
-        input_dim: 3 for xyz only, 6 for xyz+normals. Normals are embedded as
-            additional input attributes; xyz remains the geometry used for FPS/kNN.
+    The official ModelNet40 PointMLP consumes xyz only. If this project passes
+    xyz+normals tensors, normals are intentionally ignored here to match the
+    upstream architecture and reported hyperparameters.
     """
 
     def __init__(
@@ -358,7 +369,7 @@ class PointMLP(nn.Module):
         self.input_dim = input_dim
         self.stages = stages
         self.points = points
-        self.embedding = ConvBNReLU1D(input_dim, embed_dim, bias=bias, activation=activation)
+        self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)
 
         self.local_grouper_list = nn.ModuleList()
         self.pre_blocks_list = nn.ModuleList()
@@ -422,7 +433,8 @@ class PointMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._to_bcn(x)
-        xyz = x[:, :3, :].transpose(2, 1).contiguous()  # (B, N, 3)
+        x = x[:, :3, :].contiguous()
+        xyz = x.transpose(2, 1).contiguous()  # (B, N, 3)
         features = self.embedding(x)  # (B, D, N)
 
         for i in range(self.stages):
